@@ -1,0 +1,57 @@
+name: Verify Alfred robotics contributions
+
+on:
+  push:
+    paths: ["projects/alfred/**", ".github/workflows/alfred.yml"]
+  pull_request:
+    paths: ["projects/alfred/**", ".github/workflows/alfred.yml"]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: projects/alfred
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: hshi74/toddlerbot
+          ref: e337f3b177b4b53abff70b31d1695a7b66cc6d2e
+          path: projects/alfred/references/toddlerbot
+      - name: Apply reviewed changes
+        run: |
+          git -C references/toddlerbot apply --check ../../patches/0001-runtime-validation.patch
+          git -C references/toddlerbot apply ../../patches/0001-runtime-validation.patch
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements-test.txt
+      - name: Run headless runtime regressions
+        working-directory: projects/alfred/references/toddlerbot
+        run: >-
+          python -m pytest -q
+          tests/test_alfred_policy_regressions.py tests/test_run_policy.py
+          tests/test_alfred_comms.py tests/test_alfred_telemetry.py
+          tests/test_alfred_dataset_logger.py
+  model-export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: hshi74/toddlerbot
+          ref: e337f3b177b4b53abff70b31d1695a7b66cc6d2e
+          path: projects/alfred/references/toddlerbot
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements-model.txt
+      - run: python scripts/export_model.py
+      - run: python -m pytest -q tests/test_model_export.py

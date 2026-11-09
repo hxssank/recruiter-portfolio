@@ -1,0 +1,8 @@
+references/
+.venv/
+.venv-model/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+preview/assets/model.json

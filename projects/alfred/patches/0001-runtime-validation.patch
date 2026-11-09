@@ -1,0 +1,2316 @@
+diff --git a/.github/workflows/pytest_ci.yml b/.github/workflows/pytest_ci.yml
+index 186dfb7..5579635 100644
+--- a/.github/workflows/pytest_ci.yml
++++ b/.github/workflows/pytest_ci.yml
+@@ -1,45 +1,28 @@
+-name: Run Pytest Tests
++name: Python and MuJoCo regression tests
+ 
+ on:
+   push:
+-    branches:
+-      - main
++    branches: [main]
+   pull_request:
+-    branches:
+-      - main
++    branches: [main]
+ 
+ jobs:
+   test:
+     runs-on: ubuntu-latest
++    timeout-minutes: 10
+     steps:
+-      - name: Skip CI
+-        run: echo "Skipping tests" && exit 0
+-
+-# jobs:
+-#   test:
+-#     runs-on: ${{ matrix.os }}
+-
+-#     strategy:
+-#       matrix:
+-#         os: [ubuntu-latest, macos-latest, windows-latest]
+-#         python-version: ["3.10"]
+-
+-#     steps:
+-#       - name: Checkout Repository
+-#         uses: actions/checkout@v4
+-#         with:
+-#           submodules: recursive  # Ensures all submodules are checked out
+-
+-#       - name: Set Up Python
+-#         uses: actions/setup-python@v5
+-#         with:
+-#           python-version: ${{ matrix.python-version }}
+-
+-#       - name: Install Dependencies
+-#         run: |
+-#           python -m pip install --upgrade pip
+-#           pip install toddlerbot/brax
+-#           pip install ".[test]"
+-
+-#       - name: Run Tests
+-#         run: pytest tests/
+\ No newline at end of file
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with:
++          python-version: "3.12"
++      - name: Install headless test dependencies
++        run: >-
++          python -m pip install
++          pytest numpy==1.26.4 scipy==1.13.1 mujoco==3.3.4
++          jax==0.4.28 jaxlib==0.4.28 pyyaml joblib lz4 colorama line-profiler pyzmq
++      - name: Test policy launch, physics steps, telemetry, and messages
++        run: >-
++          python -m pytest -q
++          tests/test_alfred_policy_regressions.py tests/test_run_policy.py
++          tests/test_alfred_comms.py tests/test_alfred_telemetry.py
++          tests/test_alfred_dataset_logger.py
+diff --git a/tests/test_run_policy.py b/tests/test_run_policy.py
+index f768cf3..adb4b28 100644
+--- a/tests/test_run_policy.py
++++ b/tests/test_run_policy.py
+@@ -1,64 +1,85 @@
+-# test_run_policy.py
++"""Bounded, headless MuJoCo smoke tests. No devices or model downloads."""
+ 
+-import os
+-import threading
+-import time
++from pathlib import Path
+ 
+-import gdown
++import joblib
++import mujoco
++import numpy as np
++import pytest
+ 
+-from toddlerbot.policies.run_policy import main
++from toddlerbot.policies.replay import ReplayPolicy
++from toddlerbot.policies.stand import StandPolicy
++from toddlerbot.sim.mujoco_sim import MuJoCoSim
++from toddlerbot.sim.robot import Robot
++
++ROOT = Path(__file__).resolve().parents[1]
+ 
+ 
+-def run_policy(policy: str, args: list = [], sleep_time: int = 1):
+-    """
+-    Test that the policy runs for 5 seconds and can be interrupted.
+-    """
+-    # Start the policy in a separate thread
+-    policy_thread = threading.Thread(
+-        target=main, args=(["--policy", policy, "--vis", "none", "--no-plot", *args],)
+-    )
+-    policy_thread.start()
++@pytest.fixture
++def robot(monkeypatch: pytest.MonkeyPatch) -> Robot:
++    monkeypatch.chdir(ROOT)
++    return Robot("toddlerbot_2xc")
+ 
+-    # Let it run for 1 seconds
+-    time.sleep(sleep_time)
+ 
+-    # Send a keyboard interrupt to the thread
+-    policy_thread.join(timeout=0.1)  # Wait a bit for the thread to respond
+-    if policy_thread.is_alive():
+-        # Simulate a keyboard interrupt
+-        import ctypes
++def step_policy(
++    sim: MuJoCoSim, policy: StandPolicy | ReplayPolicy, steps: int
++) -> np.ndarray:
++    """Step the real policy and simulator; fail on errors or invalid state."""
++    initial_time = sim.data.time
++    action = None
++    for _ in range(steps):
++        obs = sim.get_observation()
++        obs.time = sim.data.time
++        assert np.isfinite(obs.motor_pos).all()
++        assert np.isfinite(obs.motor_vel).all()
++        _, action = policy.step(obs, sim)
++        assert action.shape == (sim.robot.nu,)
++        assert np.isfinite(action).all()
++        previous_time = sim.data.time
++        sim.set_motor_target(action)
++        sim.step()
++        assert sim.data.time > previous_time
++    assert sim.data.time - initial_time == pytest.approx(steps * policy.control_dt)
++    return action
+ 
+-        ctypes.pythonapi.PyThreadState_SetAsyncExc(
+-            ctypes.c_long(policy_thread.ident), ctypes.py_object(KeyboardInterrupt)
++
++@pytest.mark.parametrize("fixed_base", [False, True])
++def test_stand_policy(robot: Robot, fixed_base: bool) -> None:
++    sim = MuJoCoSim(robot, fixed_base=fixed_base)
++    try:
++        sim.data.qpos[:] = sim.home_qpos
++        mujoco.mj_forward(sim.model, sim.data)
++        policy = StandPolicy(
++            "stand_fixed" if fixed_base else "stand",
++            robot,
++            sim.get_observation().motor_pos,
+         )
+-
+-    # Wait for the thread to finish
+-    policy_thread.join()
+-
+-    # Assert that the thread has stopped
+-    assert not policy_thread.is_alive()
++        action = step_policy(sim, policy, steps=15)
++        assert policy.is_prepared
++        assert len(action) == robot.nu
++    finally:
++        sim.close()
+ 
+ 
+-def test_stand_policy():
+-    run_policy("stand")
+-
+-
+-def test_push_up_policy():
+-    run_policy("replay", ["--run-name", "push_up"])
+-
+-
+-def test_walk_policy():
+-    run_policy("walk")
+-
+-
+-def test_hug_policy():
+-    result_path = os.path.join("results", "toddlerbot_hug_dp_20250109_235450")
+-    ckpt_path = os.path.join(result_path, "best_ckpt.pth")
+-    if not os.path.exists(ckpt_path):
+-        gdown.download_folder(
+-            url="https://drive.google.com/drive/folders/1KZ6vMi3UzX8IxAdUEY6xGaYItKecuCny",
+-            output=result_path,
+-            quiet=True,
++def test_replay_fixed_completes(robot: Robot, tmp_path: Path) -> None:
++    sim = MuJoCoSim(robot, fixed_base=True)
++    try:
++        sim.data.qpos[:] = sim.home_qpos
++        mujoco.mj_forward(sim.model, sim.data)
++        start = sim.get_observation().motor_pos
++        end = start.copy()
++        end[robot.motor_ordering.index("neck_yaw_drive")] += 0.02
++        motion_path = tmp_path / "motion.lz4"
++        joblib.dump(
++            {"time": np.arange(5) * 0.02, "action": np.linspace(start, end, 5)},
++            motion_path,
++            compress="lz4",
+         )
+-
+-    run_policy("dp", ["--task", "hug", "--ckpt", "20250109_235450"], sleep_time=5)
++        policy = ReplayPolicy("replay_fixed", robot, start, str(motion_path))
++        policy.prep_duration = 0.04
++        policy.min_standby_duration = 0
++        action = step_policy(sim, policy, steps=10)
++        assert policy.is_done
++        np.testing.assert_allclose(action, end)
++    finally:
++        sim.close()
+diff --git a/toddlerbot/actuation/include/dynamixel_control/dynamixel_client.h b/toddlerbot/actuation/include/dynamixel_control/dynamixel_client.h
+index 3581e5f..263278b 100644
+--- a/toddlerbot/actuation/include/dynamixel_control/dynamixel_client.h
++++ b/toddlerbot/actuation/include/dynamixel_control/dynamixel_client.h
+@@ -3,6 +3,7 @@
+ 
+ #include <dynamixel_sdk.h>
+ #include <vector>
++#include <cstdint>
+ #include <map>
+ #include <set>
+ #include <string>
+@@ -97,8 +98,8 @@ public:
+   // utility
+   std::vector<float> get_cur_scale(int retries = 0);
+ 
+-  static int unsigned_to_signed(int value, int size);
+-  static int signed_to_unsigned(int value, int size);
++  static int32_t unsigned_to_signed(uint32_t value, int size);
++  static uint32_t signed_to_unsigned(int32_t value, int size);
+ 
+   static const std::set<DynamixelClient *> &get_open_clients()
+   {
+@@ -130,7 +131,7 @@ private:
+   bool lazy_connect_;
+ 
+   // SDK handlers
+-  dynamixel::PortHandler *port_handler_;
++  std::unique_ptr<dynamixel::PortHandler> port_handler_;
+   dynamixel::PacketHandler *packet_handler_;
+   dynamixel::GroupBulkRead bulk_reader_;
+ 
+diff --git a/toddlerbot/actuation/src/dynamixel_control/dynamixel_client.cpp b/toddlerbot/actuation/src/dynamixel_control/dynamixel_client.cpp
+index c3614ae..8ef14c5 100644
+--- a/toddlerbot/actuation/src/dynamixel_control/dynamixel_client.cpp
++++ b/toddlerbot/actuation/src/dynamixel_control/dynamixel_client.cpp
+@@ -27,13 +27,12 @@ DynamixelClient::DynamixelClient(const std::vector<int> &motor_ids,
+       lazy_connect_(lazy_connect),
+       port_handler_(dynamixel::PortHandler::getPortHandler(port.c_str())),
+       packet_handler_(dynamixel::PacketHandler::getPacketHandler(PROTOCOL_VERSION)),
+-      bulk_reader_(port_handler_, packet_handler_)
++      bulk_reader_(port_handler_.get(), packet_handler_)
+ {
+   std::call_once(cleanup_flag, []()
+                  { atexit(dynamixel_cleanup_handler); });
+   if (OPEN_CLIENTS.count(this))
+     throw std::runtime_error("Client already registered for port " + port_name_);
+-  OPEN_CLIENTS.insert(this);
+ 
+   // init bulk reader params
+   for (int id : motor_ids_)
+@@ -46,11 +45,20 @@ DynamixelClient::DynamixelClient(const std::vector<int> &motor_ids,
+ 
+   if (!lazy_connect_)
+     connect();
++  OPEN_CLIENTS.insert(this);
+ }
+ 
+ DynamixelClient::~DynamixelClient()
+ {
+-  disconnect();
++  try
++  {
++    disconnect();
++  }
++  catch (const std::exception &error)
++  {
++    std::cerr << "Dynamixel disconnect failed: " << error.what() << std::endl;
++  }
++  OPEN_CLIENTS.erase(this);
+ }
+ 
+ void DynamixelClient::connect()
+@@ -59,18 +67,22 @@ void DynamixelClient::connect()
+     return;
+   if (!port_handler_->openPort())
+     throw std::runtime_error("Failed to open port " + port_name_);
+-  is_open_ = true;
+   if (!port_handler_->setBaudRate(baudrate_))
+   {
+     port_handler_->closePort();
+     throw std::runtime_error("Failed to set baudrate");
+   }
++  is_open_ = true;
++  OPEN_CLIENTS.insert(this);
+ }
+ 
+ void DynamixelClient::disconnect()
+ {
+   if (!is_connected())
++  {
++    OPEN_CLIENTS.erase(this);
+     return;
++  }
+   set_torque_enabled(motor_ids_, false, 0);
+ 
+   for (auto &p : sync_readers_)
+@@ -110,7 +122,7 @@ void DynamixelClient::reboot(const std::vector<int> &ids)
+ {
+   check_connected();
+   for (int id : ids)
+-    packet_handler_->reboot(port_handler_, (uint8_t)id);
++    packet_handler_->reboot(port_handler_.get(), (uint8_t)id);
+ }
+ 
+ void DynamixelClient::clear_multi_turn(const std::vector<int> &ids)
+@@ -118,7 +130,7 @@ void DynamixelClient::clear_multi_turn(const std::vector<int> &ids)
+   check_connected();
+   for (int id : ids)
+   {
+-    packet_handler_->clearMultiTurn(port_handler_, (uint8_t)id);
++    packet_handler_->clearMultiTurn(port_handler_.get(), (uint8_t)id);
+   }
+ }
+ 
+@@ -127,7 +139,7 @@ void DynamixelClient::clear_error(const std::vector<int> &ids)
+   check_connected();
+   for (int id : ids)
+   {
+-    packet_handler_->clearError(port_handler_, (uint8_t)id);
++    packet_handler_->clearError(port_handler_.get(), (uint8_t)id);
+   }
+ }
+ 
+@@ -140,7 +152,7 @@ DynamixelClient::sync_read(uint16_t addr, uint16_t len, float scale)
+   auto key = std::make_pair(addr, len);
+   if (!sync_readers_.count(key))
+   {
+-    auto *r = new dynamixel::GroupSyncRead(port_handler_, packet_handler_, addr, len);
++    auto *r = new dynamixel::GroupSyncRead(port_handler_.get(), packet_handler_, addr, len);
+     for (int id : motor_ids_)
+       r->addParam((uint8_t)id);
+     sync_readers_[key] = r;
+@@ -278,7 +290,7 @@ void DynamixelClient::sync_write(const std::vector<int> &ids,
+   if (!sync_writers_.count(key))
+   {
+     sync_writers_[key] = new dynamixel::GroupSyncWrite(
+-        port_handler_, packet_handler_, addr, len);
++        port_handler_.get(), packet_handler_, addr, len);
+   }
+   auto *gw = sync_writers_[key];
+ 
+@@ -367,30 +379,36 @@ std::vector<int> DynamixelClient::write_byte(const std::vector<int> &ids, int va
+   for (int id : ids)
+   {
+     uint8_t xe = 0;
+-    int r = packet_handler_->write1ByteTxRx(port_handler_, id, addr, val, &xe);
++    int r = packet_handler_->write1ByteTxRx(port_handler_.get(), id, addr, val, &xe);
+     if (!handle_packet_result(r, xe, id, "write_byte"))
+       f.push_back(id);
+   }
+   return f;
+ }
+ 
+-int DynamixelClient::unsigned_to_signed(int v, int s)
++int32_t DynamixelClient::unsigned_to_signed(uint32_t v, int s)
+ {
+-  int bits = 8 * s;
+-  if (v & (1 << (bits - 1)))
+-    v -= 1 << bits;
+-  return v;
++  if (s < 1 || s > 4)
++    throw std::invalid_argument("Register size must be 1 to 4 bytes");
++  const uint64_t modulus = uint64_t{1} << (8 * s);
++  const uint64_t raw = static_cast<uint64_t>(v) & (modulus - 1);
++  const int64_t signed_value = raw >= modulus / 2
++      ? static_cast<int64_t>(raw) - static_cast<int64_t>(modulus)
++      : static_cast<int64_t>(raw);
++  return static_cast<int32_t>(signed_value);
+ }
+-int DynamixelClient::signed_to_unsigned(int v, int s)
++uint32_t DynamixelClient::signed_to_unsigned(int32_t v, int s)
+ {
+-  if (v < 0)
+-    v = (1 << (8 * s)) + v;
+-  return v;
++  if (s < 1 || s > 4)
++    throw std::invalid_argument("Register size must be 1 to 4 bytes");
++  const uint64_t mask = (uint64_t{1} << (8 * s)) - 1;
++  return static_cast<uint32_t>(static_cast<uint64_t>(v) & mask);
+ }
+ 
+ void dynamixel_cleanup_handler()
+ {
+-  for (auto c : DynamixelClient::get_open_clients())
++  const auto clients = DynamixelClient::get_open_clients();
++  for (auto c : clients)
+     try
+     {
+       c->disconnect();
+diff --git a/toddlerbot/locomotion/ppo_config.py b/toddlerbot/locomotion/ppo_config.py
+index fc6f3aa..3ec203a 100644
+--- a/toddlerbot/locomotion/ppo_config.py
++++ b/toddlerbot/locomotion/ppo_config.py
+@@ -42,5 +42,5 @@ class PPOConfig:
+     num_envs: int = 4096  # 4096
+     render_nums: int = 20
+     batch_size: int = 512  # 512
+-    num_minibatches: int = 16  # 16
++    num_minibatches: int = 8
+     seed: int = 0
+diff --git a/toddlerbot/policies/dp_policy.py b/toddlerbot/policies/dp_policy.py
+index 8d0b32e..91abed8 100644
+--- a/toddlerbot/policies/dp_policy.py
++++ b/toddlerbot/policies/dp_policy.py
+@@ -30,12 +30,42 @@ from toddlerbot.utils.math_utils import get_action_traj, interpolate_action
+ class DPPolicy(BalancePDPolicy):
+     """Policy for executing manipulation tasks using a deep policy model."""
+ 
++    @staticmethod
++    def load_preparation_pose(robot: Robot, task: str) -> npt.NDArray[np.float32]:
++        """Map a bundled preparation motion onto this robot's motor names."""
++        variant = robot.name.removeprefix("toddlerbot_").removesuffix("_gripper")
++        if variant not in {"2xc", "2xm"} or task not in {"pick", "hug"}:
++            raise ValueError("No bundled preparation motion for this robot and task")
++        prep = "kneel" if task == "pick" else "hold"
++        motion_path = os.path.join(
++            os.path.dirname(__file__), "..", "..", "motion", f"{prep}_{variant}.lz4"
++        )
++        data = joblib.load(motion_path)
++        if not isinstance(data, dict) or "action" not in data:
++            raise ValueError(f"Preparation motion has no action array: {motion_path}")
++        source_robot = Robot(f"toddlerbot_{variant}")
++        actions = np.asarray(data["action"], dtype=np.float32)
++        if (
++            actions.ndim != 2
++            or actions.shape[0] == 0
++            or actions.shape[1] != len(source_robot.motor_ordering)
++            or not np.isfinite(actions).all()
++        ):
++            raise ValueError(f"Invalid preparation action array: {motion_path}")
++        pose = dict(zip(source_robot.motor_ordering, actions[-1]))
++        for name in robot.motor_ordering:
++            if name not in pose:
++                if not robot.has_gripper or name not in {"left_gripper_rack", "right_gripper_rack"}:
++                    raise ValueError(f"Preparation motion does not define motor {name}")
++                pose[name] = robot.default_motor_angles[name]
++        return np.array([pose[name] for name in robot.motor_ordering], dtype=np.float32)
++
+     def __init__(
+         self,
+         name: str,
+         robot: Robot,
+         init_motor_pos: npt.NDArray[np.float32],
+-        ckpt: str,
++        ckpt: str = "",
+         joystick: Optional[Joystick] = None,
+         cameras: Optional[List[Camera]] = None,
+         zmq_receiver: Optional[ZMQNode] = None,
+@@ -43,6 +73,7 @@ class DPPolicy(BalancePDPolicy):
+         ip: str = "",
+         fixed_command: Optional[npt.NDArray[np.float32]] = None,
+         task: str = "",
++        path: str = "",
+     ):
+         """Initializes the robot control system with specified parameters and loads the appropriate policy model.
+ 
+@@ -50,7 +81,8 @@ class DPPolicy(BalancePDPolicy):
+             name (str): The name of the robot control instance.
+             robot (Robot): The robot object to be controlled.
+             init_motor_pos (npt.NDArray[np.float32]): Initial positions of the robot's motors.
+-            ckpt (str): Checkpoint identifier for loading the policy model.
++            ckpt (str): Legacy run identifier for loading the policy model.
++            path (str): Checkpoint file supplied by the policy launcher.
+             joystick (Optional[Joystick]): Joystick object for manual control, if available.
+             cameras (Optional[List[Camera]]): List of camera objects for visual input, if available.
+             zmq_receiver (Optional[ZMQNode]): ZMQ node for receiving data, if applicable.
+@@ -62,6 +94,28 @@ class DPPolicy(BalancePDPolicy):
+         Raises:
+             ValueError: If the motion data file for the specified task is not found.
+         """
++        if task not in {"pick", "hug"}:
++            raise ValueError("DPPolicy requires task='pick' or task='hug'")
++        if path and ckpt:
++            raise ValueError("Specify either path or ckpt, not both")
++        if path:
++            policy_path = path
++        elif len(ckpt) > 0:
++            run_name = f"{robot.name}_{task}_dp_{ckpt}"
++            policy_path = os.path.join("results", run_name, "best_ckpt.pth")
++            if not os.path.exists(policy_path):
++                policy_path = os.path.join("results", run_name, "last_ckpt.pth")
++        else:
++            policy_path = os.path.join(
++                "toddlerbot",
++                "policies",
++                "checkpoints",
++                f"{robot.name}_{task}_dp.pth",
++            )
++
++        if not os.path.isfile(policy_path):
++            raise FileNotFoundError(f"Policy checkpoint not found: {policy_path}")
++
+         super().__init__(
+             name,
+             robot,
+@@ -77,21 +131,6 @@ class DPPolicy(BalancePDPolicy):
+         self.zmq_sender = None
+ 
+         self.task = task
+-        prep = "kneel" if task == "pick" else "hold"
+-
+-        if len(ckpt) > 0:
+-            run_name = f"{self.robot.name}_{task}_dp_{ckpt}"
+-            policy_path = os.path.join("results", run_name, "best_ckpt.pth")
+-            if not os.path.exists(policy_path):
+-                policy_path = os.path.join("results", run_name, "last_ckpt.pth")
+-        else:
+-            policy_path = os.path.join(
+-                "toddlerbot",
+-                "policies",
+-                "checkpoints",
+-                f"{self.robot.name}_{task}_dp.pth",
+-            )
+-
+         self.model = DPModel(policy_path)
+         print(f"Loading policy from {policy_path}")
+ 
+@@ -122,25 +161,12 @@ class DPPolicy(BalancePDPolicy):
+             self.idle_duration = 5.0 if task == "hug" else 6.0
+             self.reset_duration = 7.0 if task == "hug" else 2.0
+ 
+-            motion_file_path = os.path.join("motion", f"{prep}.pkl")
+-            if os.path.exists(motion_file_path):
+-                data_dict = joblib.load(motion_file_path)
+-            else:
+-                raise ValueError(f"No data files found in {motion_file_path}")
+-
+-            self.manip_motor_pos = np.array(data_dict["action_traj"], dtype=np.float32)[
+-                -1
+-            ]
++            self.manip_motor_pos = self.load_preparation_pose(robot, task)
+             self.manip_motor_pos[self.neck_pitch_idx] *= self.neck_pitch_ratio
+             if task == "hug":
+                 self.manip_motor_pos[self.left_sho_pitch_idx] -= 0.2
+                 self.manip_motor_pos[self.right_sho_pitch_idx] += 0.2
+ 
+-            if self.robot.has_gripper:
+-                self.manip_motor_pos = np.concatenate(
+-                    [self.manip_motor_pos, np.zeros(2, dtype=np.float32)]
+-                )
+-
+         self.capture_rgb = True
+         self.manip_count = 0
+         self.wrap_up_time = None
+diff --git a/toddlerbot/policies/mjx_policy.py b/toddlerbot/policies/mjx_policy.py
+index 2cf873a..012a553 100644
+--- a/toddlerbot/policies/mjx_policy.py
++++ b/toddlerbot/policies/mjx_policy.py
+@@ -12,9 +12,9 @@ import jax
+ import numpy as np
+ import numpy.typing as npt
+ import onnxruntime as ort
++import wandb
+ from scipy.spatial.transform import Rotation as R
+ 
+-import wandb
+ from toddlerbot.policies import BasePolicy
+ from toddlerbot.sim import BaseSim, Obs
+ from toddlerbot.sim.robot import Robot
+@@ -26,11 +26,12 @@ device = "cpu"
+ 
+ def load_wandb_policy(
+     name: str, project="ToddlerBot", entity="toddlerbot"
+-) -> dict[str, Any]:
++) -> str:
+     """Load a policy from WandB artifacts."""
+     root = os.path.join("ckpts", name)
+     ckpt_path = os.path.join(root, "model_best.onnx")
+-    if not os.path.exists(ckpt_path):
++    config_path = os.path.join(root, "env_config.json")
++    if not all(os.path.isfile(path) for path in (ckpt_path, config_path)):
+         if wandb.run:
+             run = wandb.run
+         else:
+@@ -40,12 +41,22 @@ def load_wandb_policy(
+         os.makedirs(root, exist_ok=True)
+         artifact.download(root=root)
+ 
++    for path in (ckpt_path, config_path):
++        if not os.path.isfile(path):
++            raise FileNotFoundError(f"Policy artifact is missing required file: {path}")
+     return root
+ 
+ 
+ class MJXPolicy(BasePolicy):
+     """Policy for controlling the robot using the MJX model."""
+ 
++    @staticmethod
++    def load_env_config(path: str) -> dict[str, Any]:
++        """Read terrain settings without starting policy inference or input devices."""
++        exp_folder_path = load_wandb_policy(path)
++        with open(os.path.join(exp_folder_path, "env_config.json")) as config_file:
++            return json.load(config_file)
++
+     def __init__(
+         self,
+         name: str,
+@@ -87,7 +98,7 @@ class MJXPolicy(BasePolicy):
+         self.input_name = self.session.get_inputs()[0].name
+         self.output_name = self.session.get_outputs()[0].name
+ 
+-        self.env_cfg = json.load(open(os.path.join(exp_folder_path, "env_config.json")))
++        self.env_cfg = self.load_env_config(path)
+ 
+         self.command_obs_indices = self.env_cfg["commands"]["command_obs_indices"]
+         self.command_range = np.array(
+diff --git a/toddlerbot/policies/run_policy.py b/toddlerbot/policies/run_policy.py
+index b76de0a..5bc5702 100644
+--- a/toddlerbot/policies/run_policy.py
++++ b/toddlerbot/policies/run_policy.py
+@@ -16,9 +16,9 @@ import matplotlib.pyplot as plt
+ import mujoco
+ import numpy as np
+ import numpy.typing as npt
++import wandb
+ from tqdm import tqdm
+ 
+-import wandb
+ from toddlerbot.policies import BasePolicy
+ from toddlerbot.sim import BaseSim, Obs
+ from toddlerbot.sim.mujoco_sim import MuJoCoSim
+@@ -62,7 +62,9 @@ def get_policy_class(policy_name: str) -> Type[BasePolicy]:
+     for module_name in module_name_list:
+         try:
+             module = importlib.import_module(module_name)
+-        except ModuleNotFoundError:
++        except ModuleNotFoundError as exc:
++            if exc.name != module_name:
++                raise
+             errors.append(f"Module '{module_name}' not found")
+             continue
+ 
+@@ -499,7 +501,7 @@ def main(args=None):
+     )
+     parser.add_argument("--task", type=str, default="", help="The name of the task.")
+     parser.add_argument(
+-        "--plot", action="store_true", default=False, help="Skip the plot functions."
++        "--plot", action="store_true", default=False, help="Show plots after the run."
+     )
+     parser.add_argument(
+         "--record",
+@@ -524,48 +526,26 @@ def main(args=None):
+     robot = Robot(args.robot)
+ 
+     PolicyClass = get_policy_class(args.policy.replace("_fixed", ""))
+-    temp_init_motor_pos = np.zeros(robot.nu)  # Temporary value
+-    if len(args.path) > 0:
+-        # Create PolicyClass to load env_config.json
+-        policy_for_cfg = PolicyClass(
+-            name=args.policy,
+-            robot=robot,
+-            init_motor_pos=temp_init_motor_pos,
+-            path=args.path,
+-        )
+-    else:
+-        # No env_config.json to parse
+-        policy_for_cfg = None
++    env_cfg_to_use = {}
++    if args.path and hasattr(PolicyClass, "load_env_config"):
++        env_cfg_to_use = PolicyClass.load_env_config(args.path)
+ 
+     sim: BaseSim | None = None
+     if args.sim == "mujoco":
+         xml_path = ""
+         model = None
+ 
+-        if hasattr(policy_for_cfg, "env_cfg") and policy_for_cfg.env_cfg:
+-            print("Generating terrain from policy's env_config.json...")
+-            env_cfg_to_use = policy_for_cfg.env_cfg
+-        else:
+-            print(
+-                "Warning: --terrain_from_config was set, but no config found. Using default."
+-            )
+-            env_cfg_to_use = {
+-                "terrain": {
+-                    "manual_map": [["flat"]],  # Use this for default scene
+-                    # "manual_map": [["testbed"]],
+-                    "tile_width": 4.0,
+-                    "tile_length": 4.0,
+-                    "resolution_per_meter": 16,
+-                    "scene": "",  # e.g., "scene_climb_up_box"
+-                }
+-            }
+-
+         # --- Environment Generation Logic ---
+         terrain_cfg = env_cfg_to_use.get("terrain", {})
+         scene_name = terrain_cfg.get("scene") if terrain_cfg else None
+         print(f"Scene name: {scene_name}")
+ 
+-        if scene_name:
++        fixed_base = args.policy.endswith("_fixed")
++        if fixed_base:
++            xml_path = os.path.join(
++                "toddlerbot", "descriptions", robot.name, "scene_fixed.xml"
++            )
++        elif scene_name:
+             # Remove '_mjx' from scene name for MuJoCo compatibility
+             mujoco_scene_name = scene_name.replace("_mjx", "")
+             print(f"Loading scene: {mujoco_scene_name} (from config: {scene_name})")
+@@ -615,7 +595,7 @@ def main(args=None):
+         sim = MuJoCoSim(
+             robot,
+             vis_type=args.vis,
+-            fixed_base="fixed" in args.policy,
++            fixed_base=fixed_base,
+             xml_path=xml_path,
+             model=model,
+         )
+diff --git a/toddlerbot/sim/mujoco_sim.py b/toddlerbot/sim/mujoco_sim.py
+index 38cc04f..6611990 100644
+--- a/toddlerbot/sim/mujoco_sim.py
++++ b/toddlerbot/sim/mujoco_sim.py
+@@ -11,7 +11,6 @@ from scipy.spatial.transform import Rotation as R
+ 
+ from toddlerbot.sim import BaseSim, Obs
+ from toddlerbot.sim.motor_control import MotorController, PositionController
+-from toddlerbot.sim.mujoco_utils import MuJoCoRenderer, MuJoCoViewer
+ from toddlerbot.sim.robot import Robot
+ from toddlerbot.sim.terrain.get_elevation import (
+     get_elevation_map,
+@@ -81,6 +80,16 @@ class MuJoCoSim(BaseSim):
+             self.model = model
+         else:
+             self.model = mujoco.MjModel.from_xml_path(xml_path)
++        joint_types = np.asarray(self.model.jnt_type)
++        free_joint_indices = np.flatnonzero(joint_types == mujoco.mjtJoint.mjJNT_FREE)
++        expected_free_joints = [] if fixed_base else [0]
++        if free_joint_indices.tolist() != expected_free_joints:
++            raise ValueError(
++                f"fixed_base={fixed_base} is incompatible with the model's free joints "
++                f"at indices {free_joint_indices.tolist()}"
++            )
++        if np.any(joint_types == mujoco.mjtJoint.mjJNT_BALL):
++            raise ValueError("MuJoCoSim joint indexing does not support ball joints")
+         self.data = mujoco.MjData(self.model)
+ 
+         self.model.opt.timestep = self.dt
+@@ -99,6 +108,8 @@ class MuJoCoSim(BaseSim):
+                 for name in self.robot.joint_ordering
+             ]
+         )
++        if np.any(self.motor_indices < 0) or np.any(self.joint_indices < 0):
++            raise ValueError("Robot motor or joint names are missing from the MuJoCo model")
+         if not self.fixed_base:
+             self.motor_indices -= 1
+             self.joint_indices -= 1
+@@ -109,6 +120,8 @@ class MuJoCoSim(BaseSim):
+                 for name in self.robot.motor_ordering
+             ]
+         )
++        if np.any(self.actuator_indices < 0):
++            raise ValueError("Robot actuator names are missing from the MuJoCo model")
+         self.q_start_idx = 0 if self.fixed_base else 7
+         self.qd_start_idx = 0 if self.fixed_base else 6
+ 
+@@ -127,8 +140,12 @@ class MuJoCoSim(BaseSim):
+             self.controller = PositionController()
+ 
+         if vis_type == "render":
++            from toddlerbot.sim.mujoco_utils import MuJoCoRenderer
++
+             self.visualizer = MuJoCoRenderer(self.model)
+         elif vis_type == "view":
++            from toddlerbot.sim.mujoco_utils import MuJoCoViewer
++
+             self.visualizer = MuJoCoViewer(robot, self.model, self.data)
+         else:
+             self.visualizer = None
+@@ -330,7 +347,7 @@ class MuJoCoSim(BaseSim):
+                 torso_quat = np.array([1, 0, 0, 0], dtype=np.float32)
+ 
+             # Create rotation object from torso quaternion
+-            torso_rot = R.from_quat(torso_quat, scalar_first=True)
++            torso_rot = R.from_quat(torso_quat[[1, 2, 3, 0]])
+             torso_rot_inv = torso_rot.inv()
+ 
+             # Rotate global velocities into torso frame
+@@ -508,6 +525,10 @@ class MuJoCoSim(BaseSim):
+             render_every (int): The frequency at which frames are rendered.
+             name (str, optional): The name of the output video file. Defaults to "eval.mp4".
+         """
++        if self.visualizer is None:
++            return
++        from toddlerbot.sim.mujoco_utils import MuJoCoRenderer
++
+         if isinstance(self.visualizer, MuJoCoRenderer):
+             self.visualizer.save_recording(exp_folder_path, dt, render_every, name)
+ 
+diff --git a/toddlerbot/sim/real_world.py b/toddlerbot/sim/real_world.py
+index a31738f..1aecd91 100644
+--- a/toddlerbot/sim/real_world.py
++++ b/toddlerbot/sim/real_world.py
+@@ -110,7 +110,7 @@ class RealWorld(BaseSim):
+         )
+         motor_tor[motor_cur_amp * motor_vel < 0] *= 3
+         motor_tor = np.where(
+-            self.robot.cur_sensor_mask == 1,
++            np.asarray(self.robot.cur_sensor_mask, dtype=bool),
+             motor_tor,
+             motor_cur_amp * self.robot.motor_tau_max,
+         )
+@@ -170,17 +170,36 @@ class RealWorld(BaseSim):
+ 
+     # @profile()
+     def set_motor_target(
+-        self, motor_angles: Dict[str, float] | npt.NDArray[np.float32]
+-    ):
+-        """Sets the target angles for the robot's motors, adjusting for any negated motor directions and updating the positions of Dynamixel motors if present.
+-
+-        Args:
+-            motor_angles (Dict[str, float]): A dictionary mapping motor names to their target angles in degrees.
+-        """
++        self, motor_angles: dict[str, float] | npt.NDArray[np.float32]
++    ) -> None:
++        """Validate complete motor targets in radians before writing to controllers."""
++        names = self.robot.motor_ordering
++        if len(names) != self.robot.nu or len(set(names)) != self.robot.nu:
++            raise ValueError("Robot motor ordering must contain each motor exactly once")
+         if isinstance(motor_angles, dict):
+-            motor_pos = np.array(list(motor_angles.values()), dtype=np.float32)
++            if set(motor_angles) != set(names):
++                raise ValueError("Targets must contain every configured motor name")
++            values = [motor_angles[name] for name in names]
+         else:
+-            motor_pos = np.array(motor_angles, dtype=np.float32)
++            values = motor_angles
++
++        motor_pos = np.asarray(values)
++        if motor_pos.shape != (self.robot.nu,) or motor_pos.dtype.kind not in "iuf":
++            raise ValueError("Targets must be one numeric value per motor")
++        motor_pos = motor_pos.astype(np.float32)
++        if not np.isfinite(motor_pos).all():
++            raise ValueError("Motor targets must be finite")
++        limits = np.asarray(
++            [self.robot.motor_limits[name] for name in names], dtype=np.float32
++        )
++        if (
++            limits.shape != (self.robot.nu, 2)
++            or not np.isfinite(limits).all()
++            or np.any(limits[:, 0] > limits[:, 1])
++        ):
++            raise ValueError("Robot motor limits must contain finite lower/upper pairs")
++        if np.any(motor_pos < limits[:, 0]) or np.any(motor_pos > limits[:, 1]):
++            raise ValueError("Motor target exceeds configured motor limits")
+ 
+         reordered_pos = motor_pos[self.motor_unsort_idx]
+         splits = np.split(reordered_pos, np.cumsum(self.motor_lens)[:-1])
+diff --git a/toddlerbot/utils/comm_utils.py b/toddlerbot/utils/comm_utils.py
+index 0408d5d..bdcb33a 100644
+--- a/toddlerbot/utils/comm_utils.py
++++ b/toddlerbot/utils/comm_utils.py
+@@ -1,162 +1,267 @@
+-"""Communication utilities for network time sync and ZeroMQ messaging.
++"""Bounded JSON messages for local or authenticated remote ZeroMQ peers."""
+ 
+-Provides ZMQ-based communication between sender and receiver nodes and network
+-time synchronization functionality.
+-"""
+-
+-import pickle
++import base64
++import hmac
++import ipaddress
++import json
++import math
++import os
++import secrets
+ import subprocess
++import time
+ from dataclasses import dataclass
+-from typing import Dict, List, Optional
++from numbers import Real
+ 
+ import numpy as np
+ import numpy.typing as npt
+ import zmq
+ 
++MAX_PACKET_BYTES = 4 * 1024 * 1024
++MAX_MESSAGE_AGE = 30.0
++_MAGIC = b"TBZ1"
++_FIELDS = {"time", "control_inputs", "action", "fsr", "camera_frame", "text"}
++
+ 
+ @dataclass
+ class ZMQMessage:
+-    """Data class for ZMQ messages."""
++    """The fields accepted by the version 1 wire protocol."""
+ 
+     time: float
+-    control_inputs: Optional[Dict[str, float]] = None
+-    action: Optional[npt.NDArray[np.float32]] = None
+-    fsr: Optional[npt.NDArray[np.float32]] = None
+-    camera_frame: Optional[npt.NDArray[np.uint8]] = None
+-    text: Optional[str] = None
++    control_inputs: dict[str, float] | None = None
++    action: npt.NDArray[np.float32] | None = None
++    fsr: npt.NDArray[np.float32] | None = None
++    camera_frame: npt.NDArray[np.uint8] | None = None
++    text: str | None = None
+ 
+ 
+-def sync_time(ip: str):
+-    """Synchronizes the system time with a network time server.
++def _finite(value: object) -> float:
++    if isinstance(value, bool) or not isinstance(value, Real):
++        raise TypeError("Expected a finite number")
++    result = float(value)
++    if not math.isfinite(result):
++        raise ValueError("Expected a finite number")
++    return result
+ 
+-    This function connects to a network time server specified by the given IP address and adjusts the system clock to match the server's time.
+ 
+-    Args:
+-        ip (str): The IP address of the network time server to synchronize with.
+-    """
+-    assert len(ip) > 0, "IP address must be provided!"
++def _array(value: object, name: str) -> np.ndarray | None:
++    if value is None:
++        return None
++    if not isinstance(value, dict) or set(value) != {"shape", "data"}:
++        raise ValueError("Invalid array encoding")
++    shape = value["shape"]
++    if not isinstance(shape, list) or not 1 <= len(shape) <= 3:
++        raise ValueError("Invalid array dimensions")
++    if any(type(n) is not int or n < 0 for n in shape):
++        raise ValueError("Invalid array shape")
++    count = math.prod(shape)
++    limit = 2 * 1024 * 1024 if name == "camera_frame" else 256
++    if count > limit or (name != "camera_frame" and len(shape) != 1):
++        raise ValueError("Array exceeds message limits")
++    dtype = np.dtype("uint8" if name == "camera_frame" else "<f4")
++    if not isinstance(value["data"], str):
++        raise TypeError("Invalid array data")
++    raw = base64.b64decode(value["data"], validate=True)
++    if len(raw) != count * dtype.itemsize:
++        raise ValueError("Array length does not match shape")
++    result = np.frombuffer(raw, dtype=dtype).reshape(shape).copy()
++    if not np.isfinite(result).all():
++        raise ValueError("Array contains non-finite values")
++    return result
++
++
++def _message(data: object) -> ZMQMessage:
++    if not isinstance(data, dict) or set(data) != _FIELDS:
++        raise ValueError("Invalid message fields")
++    controls = data["control_inputs"]
++    if controls is not None:
++        if not isinstance(controls, dict) or len(controls) > 64:
++            raise ValueError("Invalid control inputs")
++        if any(not isinstance(k, str) or len(k) > 128 for k in controls):
++            raise ValueError("Invalid control name")
++        controls = {k: _finite(v) for k, v in controls.items()}
++    text = data["text"]
++    if text is not None and (not isinstance(text, str) or len(text) > 16384):
++        raise ValueError("Invalid text")
++    return ZMQMessage(
++        time=_finite(data["time"]),
++        control_inputs=controls,
++        action=_array(data["action"], "action"),
++        fsr=_array(data["fsr"], "fsr"),
++        camera_frame=_array(data["camera_frame"], "camera_frame"),
++        text=text,
++    )
++
++
++def encode_message(msg: ZMQMessage, key: bytes = b"") -> bytes:
++    """Encode a message with a fresh nonce and an optional SHA-256 HMAC."""
++    data = {"time": msg.time, "control_inputs": msg.control_inputs, "text": msg.text}
++    for name in ("action", "fsr", "camera_frame"):
++        value = getattr(msg, name)
++        if value is None:
++            data[name] = None
++            continue
++        array = np.asarray(value)
++        limit = 2 * 1024 * 1024 if name == "camera_frame" else 256
++        if array.size > limit or not np.isfinite(array).all():
++            raise ValueError(
++                "Array exceeds message limits or contains non-finite values"
++            )
++        if name == "camera_frame" and array.dtype != np.uint8:
++            raise ValueError("Camera data must be uint8")
++        array = array.astype("uint8" if name == "camera_frame" else "<f4")
++        data[name] = {
++            "shape": list(array.shape),
++            "data": base64.b64encode(array.tobytes()).decode("ascii"),
++        }
++    normalized = _message(data)
++    data["time"] = normalized.time
++    data["control_inputs"] = normalized.control_inputs
++    payload = json.dumps(
++        {"sent_at": time.time(), "nonce": secrets.token_hex(16), "message": data},
++        allow_nan=False,
++        separators=(",", ":"),
++    ).encode("utf-8")
++    signature = hmac.digest(key, _MAGIC + payload, "sha256") if key else bytes(32)
++    packet = _MAGIC + signature + payload
++    if len(packet) > MAX_PACKET_BYTES:
++        raise ValueError("Message exceeds wire size limit")
++    return packet
++
++
++def decode_message(packet: bytes, key: bytes = b"") -> tuple[ZMQMessage, str, float]:
++    """Reject invalid, tampered or expired packets before returning message fields."""
++    if not 36 < len(packet) <= MAX_PACKET_BYTES or packet[:4] != _MAGIC:
++        raise ValueError("Invalid message protocol or size")
++    payload = packet[36:]
++    expected = hmac.digest(key, _MAGIC + payload, "sha256") if key else bytes(32)
++    if not hmac.compare_digest(packet[4:36], expected):
++        raise ValueError("Message authentication failed")
++    envelope = json.loads(payload)
++    if not isinstance(envelope, dict) or set(envelope) != {
++        "sent_at",
++        "nonce",
++        "message",
++    }:
++        raise ValueError("Invalid message envelope")
++    sent_at = _finite(envelope["sent_at"])
++    if not -5 <= time.time() - sent_at <= MAX_MESSAGE_AGE:
++        raise ValueError("Message expired or peer clock is out of sync")
++    nonce = envelope["nonce"]
++    if not isinstance(nonce, str) or len(nonce) != 32:
++        raise ValueError("Invalid message nonce")
++    return _message(envelope["message"]), nonce, sent_at
++
++
++def sync_time(ip: str) -> None:
++    """Ask ntpdate to sync with a literal IP address without invoking a shell."""
++    ipaddress.ip_address(ip)
+     try:
+         result = subprocess.run(
+-            f"sudo ntpdate -u {ip}",
+-            shell=True,
++            ["sudo", "-n", "ntpdate", "-u", ip],
+             text=True,
+             check=True,
+             stdout=subprocess.PIPE,
++            timeout=15,
+         )
+         print(result.stdout.strip())
+-    except Exception:
++    except (OSError, subprocess.SubprocessError):
+         print("Failed to sync time with the follower!")
+ 
+ 
+ class ZMQNode:
+-    """A class for handling ZMQ communication between sender and receiver nodes."""
++    """Use loopback by default; remote peers require a shared secret.
++
++    Set TODDLERBOT_ZMQ_KEY to the same secret of at least 32 bytes on both peers.
++    Set TODDLERBOT_ZMQ_BIND_IP to the receiver's local interface for wireless use.
++    HMAC authenticates packets but does not encrypt their contents. Both peers must
++    use this protocol and their wall clocks must agree within five seconds.
++    """
+ 
+     def __init__(
+         self, type: str = "sender", ip: str = "", port: int = 5555, queue_len: int = 1
+-    ):
+-        """Initializes a ZMQ connection with specified type, IP, and queue length.
+-
+-        Args:
+-            type (str): The type of ZMQ connection, either 'sender' or 'receiver'. Defaults to 'sender'.
+-            ip (str): The IP address for the connection. Defaults to an empty string, which is replaced by '127.0.0.1'.
+-            queue_len (int): The length of the message queue. Defaults to 1.
+-
+-        Raises:
+-            ValueError: If the type is not 'sender' or 'receiver'.
+-        """
+-        self.type = type
+-        if type not in ["sender", "receiver"]:
++    ) -> None:
++        if type not in ("sender", "receiver"):
+             raise ValueError("ZMQ type must be either 'sender' or 'receiver'")
+-
++        if queue_len < 1 or not 1 <= port <= 65535:
++            raise ValueError("Invalid queue length or port")
++        self.type = type
+         self.queue_len = queue_len
+-        self.ip = ip if len(ip) > 0 else "127.0.0.1"
++        self.ip = ip or (
++            os.environ.get("TODDLERBOT_ZMQ_BIND_IP", "127.0.0.1")
++            if type == "receiver"
++            else "127.0.0.1"
++        )
++        self.key = os.environ.get("TODDLERBOT_ZMQ_KEY", "").encode("utf-8")
++        if self.key and len(self.key) < 32:
++            raise ValueError("TODDLERBOT_ZMQ_KEY must contain at least 32 bytes")
++        try:
++            local_only = ipaddress.ip_address(self.ip).is_loopback
++        except ValueError:
++            local_only = False
++        if not local_only and not self.key:
++            raise ValueError("Remote ZMQ connections require TODDLERBOT_ZMQ_KEY")
+         self.port = port
++        self.rejected_messages = 0
++        self._seen: dict[str, float] = {}
+         self.start_zmq()
+ 
+-    def start_zmq(self):
+-        """Initialize a ZeroMQ context and socket for data exchange based on the specified type.
+-
+-        Sets up a ZeroMQ context and configures a socket as either a sender or receiver. For a sender, it connects to a specified IP and port, setting options to manage message queue length and non-blocking behavior. For a receiver, it binds to a port and configures options to manage message queue length and ensure only the latest message is kept.
+-        """
+-        # Set up ZeroMQ context and socket for data exchange
++    def start_zmq(self) -> None:
++        """Create a socket with bounded queues and packets before connecting."""
+         self.zmq_context = zmq.Context()
+-        if self.type == "sender":
+-            self.socket = self.zmq_context.socket(zmq.PUSH)
+-            # Set high water mark and enable non-blocking send
+-            self.socket.setsockopt(
+-                zmq.SNDHWM, self.queue_len
+-            )  # Limit queue to 10 messages
+-            self.socket.setsockopt(zmq.LINGER, 0)
+-            self.socket.setsockopt(zmq.SNDBUF, 1024)  # Smaller send buffer
+-            # self.socket.setsockopt(
+-            #     zmq.IMMEDIATE, 1
+-            # )  # Prevent blocking if receiver is not available
+-            self.socket.connect("tcp://" + self.ip + f":{self.port}")
++        self.socket = self.zmq_context.socket(
++            zmq.PUSH if self.type == "sender" else zmq.PULL
++        )
++        self.socket.setsockopt(zmq.LINGER, 0)
++        self.socket.setsockopt(zmq.MAXMSGSIZE, MAX_PACKET_BYTES)
++        try:
++            if self.type == "sender":
++                self.socket.setsockopt(zmq.SNDHWM, self.queue_len)
++                self.socket.setsockopt(zmq.SNDBUF, 1024)
++                self.socket.connect(f"tcp://{self.ip}:{self.port}")
++            else:
++                self.socket.setsockopt(zmq.RCVHWM, 1)
++                self.socket.setsockopt(zmq.CONFLATE, 1)
++                self.socket.setsockopt(zmq.RCVBUF, 1024)
++                self.socket.bind(f"tcp://{self.ip}:{self.port}")
++        except Exception:
++            self.close()
++            raise
+ 
+-        elif self.type == "receiver":
+-            self.socket = self.zmq_context.socket(zmq.PULL)
+-            self.socket.bind(f"tcp://0.0.0.0:{self.port}")  # Listen on all interfaces
+-            self.socket.setsockopt(zmq.RCVHWM, 1)  # Limit receiver's queue to 1 message
+-            self.socket.setsockopt(zmq.CONFLATE, 1)  # Only keep the latest message
+-            self.socket.setsockopt(zmq.RCVBUF, 1024)
++    def close(self) -> None:
++        """Release socket and context without waiting for queued traffic."""
++        self.socket.close(linger=0)
++        self.zmq_context.term()
+ 
+-    def send_msg(self, msg: ZMQMessage):
+-        """Sends a serialized ZMQMessage if the instance type is 'sender'.
+-
+-        Args:
+-            msg (ZMQMessage): The message to be sent, which will be serialized.
+-
+-        Raises:
+-            ValueError: If the instance type is not 'sender'.
+-        """
++    def send_msg(self, msg: ZMQMessage) -> None:
++        """Send one validated packet without blocking the control loop."""
+         if self.type != "sender":
+             raise ValueError("ZMQ type must be 'sender' to send messages")
+-
+-        # Serialize the numpy array using pickle
+-        serialized_array = pickle.dumps(msg)
+-        # Send the serialized data
++        packet = encode_message(msg, self.key)
+         try:
+-            # Send the serialized data with non-blocking to avoid hanging if the queue is full
+-            self.socket.send(serialized_array, zmq.NOBLOCK)
+-            # print("Message sent!")
++            self.socket.send(packet, zmq.NOBLOCK)
+         except zmq.Again:
+             pass
+ 
+-    def get_msg(self, return_last: bool = True):
+-        """Retrieves messages from a ZMQ socket buffer until it is empty.
+-
+-        This method is designed to handle cases where reading from the buffer is too slow, causing issues with simple get operations. It reads all available messages from the buffer and returns either the last message or all messages, depending on the `return_last` parameter.
+-
+-        Args:
+-            return_last (bool): If True, returns only the last message received. If False, returns all messages. Defaults to True.
+-
+-        Returns:
+-            ZMQMessage or List[ZMQMessage] or None: The last message if `return_last` is True, a list of all messages if `return_last` is False, or None if no messages are available.
+-
+-        Raises:
+-            ValueError: If the ZMQ socket type is not 'receiver'.
+-        """
+-
+-        # For some reason a simple get is not working. buffer will blow up when read speed is too slow
+-        # So we will read all the way until the buffer if empty to bypass this problem
++    def get_msg(self, return_last: bool = True) -> ZMQMessage | list[ZMQMessage] | None:
++        """Drain at most 64 packets and discard invalid or replayed packets."""
+         if self.type != "receiver":
+             raise ValueError("ZMQ type must be 'receiver' to receive messages")
+-
+-        messages: List[ZMQMessage] = []
+-        while True:
++        messages: list[ZMQMessage] = []
++        now = time.time()
++        self._seen = {n: t for n, t in self._seen.items() if now - t <= MAX_MESSAGE_AGE}
++        for _ in range(64):
+             try:
+-                # Non-blocking receive
+-                serialized_array = self.socket.recv(zmq.NOBLOCK)
+-                msg = pickle.loads(serialized_array)
+-                messages.append(msg)
+-
++                packet = self.socket.recv(zmq.NOBLOCK)
+             except zmq.Again:
+-                # No more data is available
+                 break
+-
++            try:
++                msg, nonce, sent_at = decode_message(packet, self.key)
++                if nonce in self._seen or len(self._seen) >= 8192:
++                    raise ValueError("Replayed message or replay cache full")
++                self._seen[nonce] = sent_at
++                messages.append(msg)
++            except (ValueError, TypeError, OverflowError, RecursionError):
++                self.rejected_messages += 1
+         if return_last:
+-            # for message in messages:
+-            #     print(message["test"], message["time"], time.time())
+             return messages[-1] if messages else None
+-        else:
+-            return messages if messages else None
++        return messages if messages else None
+diff --git a/toddlerbot/utils/dataset_utils.py b/toddlerbot/utils/dataset_utils.py
+index df6102d..3b7f6d7 100644
+--- a/toddlerbot/utils/dataset_utils.py
++++ b/toddlerbot/utils/dataset_utils.py
+@@ -6,8 +6,10 @@ to compressed files.
+ 
+ import os
+ import shutil
++import tempfile
+ from dataclasses import dataclass, fields
+-from typing import Optional
++from pathlib import Path
++from uuid import uuid4
+ 
+ import joblib
+ import numpy as np
+@@ -21,74 +23,71 @@ class Data:
+     time: float
+     action: npt.NDArray[np.float32]
+     motor_pos: npt.NDArray[np.float32]
+-    image: Optional[npt.NDArray[np.uint8]] = None
++    image: npt.NDArray[np.uint8] | None = None
+ 
+ 
+ class DatasetLogger:
+-    """A class for logging teleoperation data during an episode and saving it to disk."""
++    """Save completed episodes without mixing independent recording sessions."""
+ 
+-    def __init__(self):
+-        """Initializes the object with an empty data list and sets the episode count to zero."""
+-        self.data_list = []
++    def __init__(self, storage_dir: str | os.PathLike | None = None) -> None:
++        root = Path(storage_dir or "datasets/raw")
++        root.mkdir(parents=True, exist_ok=True)
++        self.session_id = uuid4().hex
++        self.session_dir = root / self.session_id
++        self.session_dir.mkdir()
++        self.data_list: list[Data] = []
+         self.n_episodes = 0
+ 
+-    def log_entry(self, data: Data):
+-        """Adds a data entry to the internal list.
+-
+-        Args:
+-            data (Data): The data entry to be added to the list.
+-        """
++    def log_entry(self, data: Data) -> None:
+         self.data_list.append(data)
+ 
+-    def save(self):
+-        """Saves the current data list to a compressed file and resets the data list.
+-
+-        This method converts the attributes of each data object in `self.data_list` into a dictionary of numpy arrays, adds a start time, and saves the dictionary to a file in LZ4 compressed format. The file is named using the current number of episodes. After saving, the episode count is incremented, and the data list is cleared.
+-
+-        Attributes:
+-            data_list (list): A list of data objects to be saved.
+-            n_episodes (int): The current number of episodes logged.
+-
+-        Side Effects:
+-            Increments `self.n_episodes`.
+-            Clears `self.data_list`.
+-            Prints a log message indicating the number of episodes logged and their length.
+-        """
++    def save(self) -> Path | None:
++        """Finalize one episode atomically; retain memory if writing fails."""
++        if not self.data_list:
++            return None
+         data_dict = {
+-            field.name: np.array(
+-                [getattr(data, field.name) for data in self.data_list],
+-            )
++            field.name: np.array([getattr(data, field.name) for data in self.data_list])
+             for field in fields(Data)
+         }
+         data_dict["start_time"] = self.data_list[0].time
+-
+-        # dump to lz4 format
+-        joblib.dump(data_dict, f"/tmp/toddlerbot_{self.n_episodes}.lz4", compress="lz4")
+-
+-        self.n_episodes += 1
+-
+-        print(
+-            f"\nLogged {self.n_episodes} episodes. Episode length: {len(self.data_list)}"
++        data_dict["session_id"] = self.session_id
++        destination = self.session_dir / f"toddlerbot_{self.n_episodes:06d}.lz4"
++        fd, name = tempfile.mkstemp(
++            prefix="episode-", suffix=".partial", dir=self.session_dir
+         )
++        temporary = Path(name)
++        try:
++            with os.fdopen(fd, "wb") as output:
++                joblib.dump(data_dict, output, compress="lz4")
++                output.flush()
++                os.fsync(output.fileno())
++            # Hard-link publication fails if the episode already exists.
++            os.link(temporary, destination)
++        finally:
++            temporary.unlink(missing_ok=True)
++        self.n_episodes += 1
++        self.data_list.clear()
++        return destination
+ 
+-        self.data_list = []
+-
+-    def move_files_to_exp_folder(self, exp_folder_path: str):
+-        """Moves files with a specific naming pattern from the temporary directory to a specified experiment folder.
+-
+-        Args:
+-            exp_folder_path (str): The destination directory path where the files will be moved.
+-        """
+-        lz4_files = [
+-            f
+-            for f in os.listdir("/tmp")
+-            if f.startswith("toddlerbot_") and f.endswith(".lz4")
+-        ]
+-
+-        # Move each file to the exp_folder
+-        for file_name in lz4_files:
+-            source = os.path.join("/tmp", file_name)
+-            destination = os.path.join(exp_folder_path, file_name)
+-            shutil.move(source, destination)
+-
+-        print(f"Moved {len(lz4_files)} files to {exp_folder_path}")
++    def move_files_to_exp_folder(self, exp_folder_path: str) -> None:
++        """Copy only this session's completed files; keep durable originals."""
++        destination_dir = Path(exp_folder_path)
++        destination_dir.mkdir(parents=True, exist_ok=True)
++        for source in sorted(self.session_dir.glob("toddlerbot_*.lz4")):
++            destination = destination_dir / f"{source.stem}_{self.session_id}.lz4"
++            if destination.exists():
++                if destination.read_bytes() == source.read_bytes():
++                    continue
++                raise FileExistsError(f"Refusing to overwrite {destination}")
++            fd, name = tempfile.mkstemp(
++                prefix="episode-", suffix=".partial", dir=destination_dir
++            )
++            temporary = Path(name)
++            try:
++                with os.fdopen(fd, "wb") as output, source.open("rb") as original:
++                    shutil.copyfileobj(original, output)
++                    output.flush()
++                    os.fsync(output.fileno())
++                os.link(temporary, destination)
++            finally:
++                temporary.unlink(missing_ok=True)
+diff --git a/tests/dynamixel_cleanup_test.cpp b/tests/dynamixel_cleanup_test.cpp
+new file mode 100644
+index 0000000..7db6470
+--- /dev/null
++++ b/tests/dynamixel_cleanup_test.cpp
+@@ -0,0 +1,20 @@
++#include "dynamixel_control/dynamixel_client.h"
++#include <cassert>
++
++int main()
++{
++  const auto count = DynamixelClient::get_open_clients().size();
++  {
++    DynamixelClient first({}, "/nonexistent/alfred-test-1", 1000000, true);
++    DynamixelClient second({}, "/nonexistent/alfred-test-2", 1000000, true);
++    assert(DynamixelClient::get_open_clients().size() == count + 2);
++    dynamixel_cleanup_handler();
++    assert(DynamixelClient::get_open_clients().size() == count);
++    dynamixel_cleanup_handler();
++  }
++  {
++    DynamixelClient unused({}, "/nonexistent/alfred-test-3", 1000000, true);
++    assert(DynamixelClient::get_open_clients().size() == count + 1);
++  }
++  assert(DynamixelClient::get_open_clients().size() == count);
++}
+diff --git a/tests/dynamixel_integer_test.cpp b/tests/dynamixel_integer_test.cpp
+new file mode 100644
+index 0000000..9f9ec08
+--- /dev/null
++++ b/tests/dynamixel_integer_test.cpp
+@@ -0,0 +1,31 @@
++#include "dynamixel_control/dynamixel_client.h"
++#include <cassert>
++#include <limits>
++
++int main()
++{
++  for (int size = 1; size <= 4; ++size)
++  {
++    const uint64_t half = uint64_t{1} << (8 * size - 1);
++    const uint32_t mask = static_cast<uint32_t>((half << 1) - 1);
++    assert(DynamixelClient::unsigned_to_signed(0, size) == 0);
++    assert(DynamixelClient::unsigned_to_signed(1, size) == 1);
++    assert(DynamixelClient::unsigned_to_signed(half - 1, size) == static_cast<int64_t>(half) - 1);
++    assert(DynamixelClient::unsigned_to_signed(half, size) == -static_cast<int64_t>(half));
++    assert(DynamixelClient::unsigned_to_signed(mask, size) == -1);
++    assert(DynamixelClient::signed_to_unsigned(-1, size) == mask);
++    assert(DynamixelClient::signed_to_unsigned(-static_cast<int64_t>(half), size) == half);
++    assert(DynamixelClient::signed_to_unsigned(half - 1, size) == half - 1);
++  }
++  assert(DynamixelClient::unsigned_to_signed(0xFFFFFFFFu, 2) == -1);
++  for (int size : {-1, 0, 5, 32})
++  {
++    bool decode_failed = false;
++    bool encode_failed = false;
++    try { DynamixelClient::unsigned_to_signed(0, size); }
++    catch (const std::invalid_argument &) { decode_failed = true; }
++    try { DynamixelClient::signed_to_unsigned(0, size); }
++    catch (const std::invalid_argument &) { encode_failed = true; }
++    assert(decode_failed && encode_failed);
++  }
++}
+diff --git a/tests/test_alfred_comms.py b/tests/test_alfred_comms.py
+new file mode 100644
+index 0000000..0bce93e
+--- /dev/null
++++ b/tests/test_alfred_comms.py
+@@ -0,0 +1,179 @@
++import json
++import subprocess
++from collections import deque
++
++import numpy as np
++import pytest
++import zmq
++
++from toddlerbot.utils import comm_utils as comm
++
++KEY = b"test-only-secret-that-is-32-bytes!"
++
++
++def test_round_trip_all_fields():
++    msg = comm.ZMQMessage(
++        time=1.25,
++        control_inputs={"walk_x": 0.5},
++        action=np.arange(32, dtype=np.float32),
++        fsr=np.array([1, 2], dtype=np.float32),
++        camera_frame=np.arange(32, dtype=np.uint8).reshape(32, 1),
++        text="hello",
++    )
++    decoded, nonce, _ = comm.decode_message(comm.encode_message(msg, KEY), KEY)
++    assert decoded.time == msg.time
++    assert decoded.control_inputs == msg.control_inputs
++    assert decoded.text == msg.text
++    assert len(nonce) == 32
++    for name in ("action", "fsr", "camera_frame"):
++        np.testing.assert_array_equal(getattr(decoded, name), getattr(msg, name))
++
++
++@pytest.mark.parametrize("key", [b"", b"wrong-key"])
++def test_requires_matching_key(key):
++    with pytest.raises(ValueError, match="authentication"):
++        comm.decode_message(comm.encode_message(comm.ZMQMessage(0), KEY), key)
++
++
++def test_tampering_rejected():
++    packet = comm.encode_message(comm.ZMQMessage(0), KEY)
++    with pytest.raises(ValueError, match="authentication"):
++        comm.decode_message(packet[:-1] + b"x", KEY)
++
++
++@pytest.mark.parametrize(
++    "payload", [b"\x80\x04pickle", b"{}", b"x" * (comm.MAX_PACKET_BYTES + 1)]
++)
++def test_legacy_and_oversized_packets_rejected(payload):
++    with pytest.raises(ValueError):
++        comm.decode_message(payload)
++
++
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        {"time": float("nan")},
++        {"time": True},
++        {"action": np.array([float("inf")])},
++        {"action": np.zeros(257)},
++        {"action": np.zeros((2, 2))},
++        {"control_inputs": {"walk_x": "1"}},
++        {"camera_frame": np.zeros(3, dtype=np.float32)},
++        {"text": "x" * 16385},
++    ],
++)
++def test_invalid_fields_rejected(kwargs):
++    with pytest.raises((ValueError, TypeError)):
++        comm.encode_message(comm.ZMQMessage(**({"time": 0} | kwargs)))
++
++
++def test_forged_array_shape_rejected():
++    packet = comm.encode_message(comm.ZMQMessage(0, action=np.zeros(2)))
++    envelope = json.loads(packet[36:])
++    envelope["message"]["action"]["shape"] = [3]
++    with pytest.raises(ValueError, match="length"):
++        comm.decode_message(packet[:36] + json.dumps(envelope).encode())
++
++
++@pytest.mark.parametrize("offset", [31, -6])
++def test_expired_or_future_packets_rejected(monkeypatch, offset):
++    monkeypatch.setattr(comm.time, "time", lambda: 100)
++    packet = comm.encode_message(comm.ZMQMessage(0), KEY)
++    monkeypatch.setattr(comm.time, "time", lambda: 100 + offset)
++    with pytest.raises(ValueError, match="expired"):
++        comm.decode_message(packet, KEY)
++
++
++class FakeSocket:
++    def __init__(self, packets):
++        self.packets = deque(packets)
++
++    def recv(self, flags):
++        if not self.packets:
++            raise zmq.Again
++        return self.packets.popleft()
++
++
++def test_replay_and_bad_packets_are_dropped():
++    packet = comm.encode_message(comm.ZMQMessage(0, text="safe"), KEY)
++    node = comm.ZMQNode.__new__(comm.ZMQNode)
++    node.type = "receiver"
++    node.key = KEY
++    node.socket = FakeSocket([b"invalid", packet, packet])
++    node._seen = {}
++    node.rejected_messages = 0
++    assert node.get_msg().text == "safe"
++    assert node.rejected_messages == 2
++    assert node.get_msg() is None
++
++
++@pytest.mark.parametrize("kind", ["sender", "receiver"])
++def test_remote_requires_secret(monkeypatch, kind):
++    monkeypatch.delenv("TODDLERBOT_ZMQ_KEY", raising=False)
++    with pytest.raises(ValueError, match="require"):
++        comm.ZMQNode(type=kind, ip="192.0.2.1")
++
++
++def test_bind_is_loopback_by_default(monkeypatch):
++    monkeypatch.delenv("TODDLERBOT_ZMQ_KEY", raising=False)
++    monkeypatch.delenv("TODDLERBOT_ZMQ_BIND_IP", raising=False)
++    monkeypatch.setattr(comm.ZMQNode, "start_zmq", lambda self: None)
++    assert comm.ZMQNode(type="receiver").ip == "127.0.0.1"
++
++
++def test_explicit_bind_uses_secret(monkeypatch):
++    monkeypatch.setenv("TODDLERBOT_ZMQ_KEY", KEY.decode())
++    monkeypatch.setenv("TODDLERBOT_ZMQ_BIND_IP", "192.0.2.2")
++    monkeypatch.setattr(comm.ZMQNode, "start_zmq", lambda self: None)
++    node = comm.ZMQNode(type="receiver")
++    assert node.ip == "192.0.2.2"
++    assert node.key == KEY
++
++
++def test_time_sync_does_not_invoke_shell(monkeypatch):
++    calls = []
++
++    def run(args, **kwargs):
++        calls.append((args, kwargs))
++        return subprocess.CompletedProcess(args, 0, stdout="ok")
++
++    monkeypatch.setattr(comm.subprocess, "run", run)
++    comm.sync_time("127.0.0.1")
++    assert calls[0][0] == ["sudo", "-n", "ntpdate", "-u", "127.0.0.1"]
++    assert "shell" not in calls[0][1]
++    with pytest.raises(ValueError):
++        comm.sync_time("127.0.0.1; touch /tmp/unwanted")
++    assert len(calls) == 1
++
++
++def test_numpy_controls_encode_as_json_numbers():
++    msg = comm.ZMQMessage(np.float32(1), control_inputs={"walk_x": np.float32(0.5)})
++    decoded, _, _ = comm.decode_message(comm.encode_message(msg))
++    assert decoded.time == 1
++    assert decoded.control_inputs == {"walk_x": 0.5}
++
++
++def test_authenticated_loopback_exchange(monkeypatch):
++    import socket
++    import time
++
++    monkeypatch.setenv("TODDLERBOT_ZMQ_KEY", KEY.decode())
++    with socket.socket() as port_probe:
++        port_probe.bind(("127.0.0.1", 0))
++        port = port_probe.getsockname()[1]
++    receiver = comm.ZMQNode(type="receiver", ip="127.0.0.1", port=port)
++    sender = comm.ZMQNode(type="sender", port=port)
++    try:
++        sender.send_msg(comm.ZMQMessage(123, action=np.array([1.5, -0.5])))
++        deadline = time.monotonic() + 2
++        message = None
++        while message is None and time.monotonic() < deadline:
++            message = receiver.get_msg()
++            if message is None:
++                time.sleep(0.01)
++        assert message is not None
++        np.testing.assert_array_equal(message.action, [1.5, -0.5])
++        assert receiver.rejected_messages == 0
++    finally:
++        sender.close()
++        receiver.close()
+diff --git a/tests/test_alfred_dataset_logger.py b/tests/test_alfred_dataset_logger.py
+new file mode 100644
+index 0000000..b7dce41
+--- /dev/null
++++ b/tests/test_alfred_dataset_logger.py
+@@ -0,0 +1,79 @@
++from pathlib import Path
++
++import joblib
++import numpy as np
++import pytest
++
++from toddlerbot.utils.dataset_utils import Data, DatasetLogger
++
++
++def entry(value: float) -> Data:
++    return Data(value, np.array([value]), np.array([value]))
++
++
++def test_sessions_do_not_mix_or_overwrite(tmp_path: Path) -> None:
++    first, second = DatasetLogger(tmp_path), DatasetLogger(tmp_path)
++    first.log_entry(entry(1))
++    second.log_entry(entry(2))
++    first_file, second_file = first.save(), second.save()
++    assert first_file != second_file
++    output = tmp_path / "experiment"
++    first.move_files_to_exp_folder(str(output))
++    assert len(list(output.glob("*.lz4"))) == 1
++    second.move_files_to_exp_folder(str(output))
++    assert sorted(joblib.load(path)["start_time"] for path in output.glob("*.lz4")) == [
++        1,
++        2,
++    ]
++    first.move_files_to_exp_folder(str(output))
++    assert len(list(output.glob("*.lz4"))) == 2
++    assert first_file.exists() and second_file.exists()
++
++
++def test_empty_save_is_noop(tmp_path: Path) -> None:
++    logger = DatasetLogger(tmp_path)
++    assert logger.save() is None
++    assert logger.n_episodes == 0
++
++
++def test_failed_save_retains_samples(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    logger = DatasetLogger(tmp_path)
++    logger.log_entry(entry(3))
++
++    def fail(*args, **kwargs):
++        raise OSError("disk full")
++
++    monkeypatch.setattr(joblib, "dump", fail)
++    with pytest.raises(OSError, match="disk full"):
++        logger.save()
++    assert logger.n_episodes == 0
++    assert len(logger.data_list) == 1
++    assert not list(logger.session_dir.iterdir())
++
++
++def test_existing_episode_is_preserved(tmp_path: Path) -> None:
++    logger = DatasetLogger(tmp_path)
++    logger.log_entry(entry(1))
++    first = logger.save()
++    logger.n_episodes = 0
++    logger.log_entry(entry(2))
++    with pytest.raises(FileExistsError):
++        logger.save()
++    assert joblib.load(first)["start_time"] == 1
++    assert len(logger.data_list) == 1
++
++
++def test_export_conflict_keeps_original(tmp_path: Path) -> None:
++    logger = DatasetLogger(tmp_path)
++    logger.log_entry(entry(7))
++    original = logger.save()
++    output = tmp_path / "out"
++    logger.move_files_to_exp_folder(str(output))
++    exported = next(output.glob("*.lz4"))
++    exported.write_bytes(b"other data")
++    with pytest.raises(FileExistsError):
++        logger.move_files_to_exp_folder(str(output))
++    assert joblib.load(original)["start_time"] == 7
++    assert exported.read_bytes() == b"other data"
+diff --git a/tests/test_alfred_policy_regressions.py b/tests/test_alfred_policy_regressions.py
+new file mode 100644
+index 0000000..66fba1a
+--- /dev/null
++++ b/tests/test_alfred_policy_regressions.py
+@@ -0,0 +1,386 @@
++"""Focused launch and indexing regressions with optional policy devices isolated."""
++
++from __future__ import annotations
++
++import argparse
++import ast
++import importlib
++import json
++import os
++from dataclasses import dataclass
++from itertools import product
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import mujoco
++import numpy as np
++import pytest
++from scipy.spatial.transform import Rotation
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def load_definition(relative: str, name: str, namespace: dict) -> object:
++    """Load a real definition without importing hardware and inference backends."""
++    tree = ast.parse((ROOT / relative).read_text())
++    node = next(node for node in tree.body if getattr(node, "name", None) == name)
++    module = ast.Module(
++        body=[
++            ast.ImportFrom(
++                module="__future__", names=[ast.alias(name="annotations")], level=0
++            ),
++            node,
++        ],
++        type_ignores=[],
++    )
++    exec(compile(ast.fix_missing_locations(module), relative, "exec"), namespace)  # noqa: S102
++    return namespace[name]
++
++
++@pytest.mark.parametrize("policy_name", ["stand_fixed", "replay_fixed"])
++def test_fixed_policy_uses_fixed_scene_without_terrain(policy_name: str) -> None:
++    robot = SimpleNamespace(name="toddlerbot_2xc", nu=30)
++    policy = Mock()
++    policy.load_env_config.return_value = {"terrain": {"manual_map": [["flat"]]}}
++    sim = Mock()
++    sim.get_observation.return_value.motor_pos = np.zeros(30)
++    terrain = Mock(
++        side_effect=AssertionError("Fixed policy must not build free terrain")
++    )
++    run = Mock()
++    namespace = {
++        "argparse": argparse,
++        "os": os,
++        "np": np,
++        "Robot": Mock(return_value=robot),
++        "get_policy_class": Mock(return_value=policy),
++        "MuJoCoSim": Mock(return_value=sim),
++        "create_terrain_spec": terrain,
++        "run_policy": run,
++    }
++    main = load_definition("toddlerbot/policies/run_policy.py", "main", namespace)
++    main(["--policy", policy_name, "--path", "checkpoint"])
++    assert namespace["MuJoCoSim"].call_args.kwargs == {
++        "vis_type": "none",
++        "fixed_base": True,
++        "xml_path": "toddlerbot/descriptions/toddlerbot_2xc/scene_fixed.xml",
++        "model": None,
++    }
++    policy.assert_called_once_with(
++        name=policy_name,
++        robot=robot,
++        init_motor_pos=sim.get_observation.return_value.motor_pos,
++        path="checkpoint",
++    )
++    run.assert_called_once()
++
++
++def test_policy_dependency_error_is_not_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
++    def missing_dependency(name: str) -> None:
++        raise ModuleNotFoundError("No module named 'onnxruntime'", name="onnxruntime")
++
++    monkeypatch.setattr(importlib, "import_module", missing_dependency)
++    get_policy_class = load_definition(
++        "toddlerbot/policies/run_policy.py",
++        "get_policy_class",
++        {"importlib": importlib, "product": product},
++    )
++    with pytest.raises(ModuleNotFoundError, match="onnxruntime"):
++        get_policy_class("walk")
++
++
++def test_environment_config_does_not_construct_inference(tmp_path: Path) -> None:
++    (tmp_path / "env_config.json").write_text(
++        json.dumps({"terrain": {"scene": "scene_mjx"}})
++    )
++    cls = load_definition(
++        "toddlerbot/policies/mjx_policy.py",
++        "MJXPolicy",
++        {
++            "BasePolicy": object,
++            "os": os,
++            "json": json,
++            "load_wandb_policy": Mock(return_value=str(tmp_path)),
++        },
++    )
++    assert cls.load_env_config("walk") == {"terrain": {"scene": "scene_mjx"}}
++
++
++class StopBeforeDevices(RuntimeError):
++    pass
++
++
++class FakeBalancePolicy:
++    def __init__(self, *args: object) -> None:
++        raise StopBeforeDevices
++
++
++def dp_class() -> type:
++    return load_definition(
++        "toddlerbot/policies/dp_policy.py",
++        "DPPolicy",
++        {"BalancePDPolicy": FakeBalancePolicy, "os": os},
++    )
++
++
++def test_dp_accepts_launcher_path_before_opening_devices(tmp_path: Path) -> None:
++    path = tmp_path / "model.pth"
++    path.write_bytes(b"checkpoint placeholder")
++    with pytest.raises(StopBeforeDevices):
++        dp_class()("dp", SimpleNamespace(name="robot"), [], task="hug", path=str(path))
++
++
++@pytest.mark.parametrize(
++    "kwargs, error, message",
++    [
++        ({"task": ""}, ValueError, "requires task"),
++        ({"task": "hug", "path": "a", "ckpt": "b"}, ValueError, "either path or ckpt"),
++        (
++            {"task": "pick", "path": "/nonexistent/checkpoint.pth"},
++            FileNotFoundError,
++            "checkpoint not found",
++        ),
++    ],
++)
++def test_dp_rejects_invalid_configuration_before_devices(
++    kwargs: dict, error: type, message: str
++) -> None:
++    with pytest.raises(error, match=message):
++        dp_class()("dp", SimpleNamespace(name="robot"), [], **kwargs)
++
++
++def test_ppo_default_batch_matches_environment_count() -> None:
++    cls = load_definition(
++        "toddlerbot/locomotion/ppo_config.py",
++        "PPOConfig",
++        {"gin": SimpleNamespace(configurable=lambda cls: cls), "dataclass": dataclass},
++    )
++    cfg = cls()
++    assert cfg.num_envs == cfg.num_minibatches * cfg.batch_size
++
++
++def sim_class() -> type:
++    class FakeBaseSim:
++        def __init__(self, name: str) -> None:
++            self.name = name
++
++    return load_definition(
++        "toddlerbot/sim/mujoco_sim.py",
++        "MuJoCoSim",
++        {
++            "BaseSim": FakeBaseSim,
++            "mujoco": mujoco,
++            "np": np,
++            "os": os,
++            "MotorController": Mock(),
++            "PositionController": Mock(),
++            "Obs": SimpleNamespace,
++            "R": Rotation,
++            "time": SimpleNamespace(monotonic=lambda: 0),
++        },
++    )
++
++
++def make_model(free: bool = False, ball: bool = False) -> mujoco.MjModel:
++    root_joint = "<freejoint/>" if free else ""
++    extra = (
++        '<body><joint type="ball"/><geom type="sphere" size="0.01" mass="0.1"/></body>'
++        if ball
++        else ""
++    )
++    return mujoco.MjModel.from_xml_string(f"""<mujoco>
++      <worldbody><body name="torso" pos="0 0 1">{root_joint}
++        <geom type="sphere" size="0.1" mass="1"/>
++        <body><joint name="motor"/><geom type="capsule" size="0.02 0.1" mass="0.1"/>{extra}</body>
++      </body></worldbody>
++      <actuator><motor name="motor" joint="motor"/></actuator>
++    </mujoco>""")
++
++
++@pytest.mark.parametrize("fixed_base", [True, False])
++def test_model_layout_and_joint_observation(fixed_base: bool) -> None:
++    model = make_model(free=not fixed_base)
++    robot = SimpleNamespace(
++        name="test", motor_ordering=["motor"], joint_ordering=["motor"]
++    )
++    sim = sim_class()(robot, fixed_base=fixed_base, model=model)
++    sim.data.joint("motor").qpos[0] = 0.25
++    sim.data.joint("motor").qvel[0] = 0.5
++    assert sim.get_observation().motor_pos.tolist() == [0.25]
++    assert sim.get_observation().motor_vel.tolist() == [0.5]
++    mujoco.mj_step(model, sim.data)
++    assert sim.data.time > 0
++    assert np.isfinite(sim.get_observation().motor_pos).all()
++
++
++@pytest.mark.parametrize("fixed_base", [True, False])
++def test_mismatched_base_layout_is_rejected(fixed_base: bool) -> None:
++    robot = SimpleNamespace(
++        name="test", motor_ordering=["motor"], joint_ordering=["motor"]
++    )
++    with pytest.raises(ValueError, match="incompatible"):
++        sim_class()(robot, fixed_base=fixed_base, model=make_model(free=fixed_base))
++
++
++def test_ball_joint_layout_is_rejected() -> None:
++    robot = SimpleNamespace(
++        name="test", motor_ordering=["motor"], joint_ordering=["motor"]
++    )
++    with pytest.raises(ValueError, match="ball joints"):
++        sim_class()(robot, fixed_base=True, model=make_model(ball=True))
++
++
++def test_missing_robot_joint_is_rejected() -> None:
++    robot = SimpleNamespace(
++        name="test", motor_ordering=["missing"], joint_ordering=["motor"]
++    )
++    with pytest.raises(ValueError, match="names are missing"):
++        sim_class()(robot, fixed_base=True, model=make_model())
++
++
++@pytest.mark.parametrize(
++    "filename, fixed_base", [("scene.xml", False), ("scene_fixed.xml", True)]
++)
++def test_reference_2xc_model_compiles_and_advances(
++    filename: str, fixed_base: bool
++) -> None:
++    model = mujoco.MjModel.from_xml_path(
++        str(ROOT / "toddlerbot/descriptions/toddlerbot_2xc" / filename)
++    )
++    motor_names = [model.actuator(index).name for index in range(model.nu)]
++    robot = SimpleNamespace(
++        name="toddlerbot_2xc", motor_ordering=motor_names, joint_ordering=motor_names
++    )
++    sim = sim_class()(robot, model=model, fixed_base=fixed_base)
++    sim.data.qpos[:] = model.keyframe("home").qpos
++    mujoco.mj_step(model, sim.data)
++    obs = sim.get_observation()
++    assert sim.data.time == pytest.approx(0.001)
++    assert obs.motor_pos.shape == (30,)
++    assert np.isfinite(obs.motor_pos).all()
++    assert np.isfinite(obs.motor_vel).all()
++
++
++@pytest.mark.parametrize("filename", ["best_ckpt.pth", "last_ckpt.pth"])
++def test_dp_preserves_legacy_checkpoint_selection(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str
++) -> None:
++    monkeypatch.chdir(tmp_path)
++    checkpoint = tmp_path / "results" / "robot_hug_dp_run" / filename
++    checkpoint.parent.mkdir(parents=True)
++    checkpoint.write_bytes(b"checkpoint placeholder")
++    with pytest.raises(StopBeforeDevices):
++        dp_class()(
++            name="dp",
++            robot=SimpleNamespace(name="robot"),
++            init_motor_pos=[],
++            task="hug",
++            ckpt="run",
++        )
++
++
++def preparation_policy() -> type:
++    import joblib
++
++    from toddlerbot.sim.robot import Robot
++
++    return load_definition(
++        "toddlerbot/policies/dp_policy.py",
++        "DPPolicy",
++        {
++            "BalancePDPolicy": object,
++            "os": os,
++            "np": np,
++            "joblib": joblib,
++            "Robot": Robot,
++            "__file__": str(ROOT / "toddlerbot/policies/dp_policy.py"),
++        },
++    )
++
++
++@pytest.mark.parametrize("variant", ["2xc", "2xm", "2xc_gripper", "2xm_gripper"])
++@pytest.mark.parametrize("task", ["pick", "hug"])
++def test_bundled_dp_preparation_pose(
++    variant: str, task: str, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    from toddlerbot.sim.robot import Robot
++
++    monkeypatch.chdir(ROOT)
++    robot = Robot(f"toddlerbot_{variant}")
++    pose = preparation_policy().load_preparation_pose(robot, task)
++    assert pose.shape == (robot.nu,)
++    assert np.isfinite(pose).all()
++    if robot.has_gripper:
++        for name in ("left_gripper_rack", "right_gripper_rack"):
++            assert (
++                pose[robot.motor_ordering.index(name)]
++                == robot.default_motor_angles[name]
++            )
++
++
++@pytest.mark.parametrize(
++    "actions",
++    [np.zeros((0, 30)), np.zeros((2, 31)), np.full((2, 30), np.nan), np.zeros(30)],
++)
++def test_dp_preparation_rejects_malformed_actions(
++    actions: np.ndarray, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    import joblib
++
++    from toddlerbot.sim.robot import Robot
++
++    monkeypatch.chdir(ROOT)
++    robot = Robot("toddlerbot_2xc_gripper")
++    monkeypatch.setattr(joblib, "load", lambda path: {"action": actions})
++    with pytest.raises(ValueError, match="Invalid preparation action array"):
++        preparation_policy().load_preparation_pose(robot, "pick")
++
++
++def test_cached_checkpoint_without_config_downloads_complete_bundle(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.chdir(tmp_path)
++    root = tmp_path / "ckpts" / "walk"
++    root.mkdir(parents=True)
++    (root / "model_best.onnx").touch()
++    artifact = Mock()
++    artifact.download.side_effect = lambda root: (
++        Path(root) / "env_config.json"
++    ).write_text("{}")
++    run = Mock()
++    run.use_artifact.return_value = artifact
++    load = load_definition(
++        "toddlerbot/policies/mjx_policy.py",
++        "load_wandb_policy",
++        {"os": os, "wandb": SimpleNamespace(run=run)},
++    )
++    assert load("walk") == os.path.join("ckpts", "walk")
++    artifact.download.assert_called_once()
++
++
++def test_incomplete_download_fails_before_inference(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.chdir(tmp_path)
++    run = Mock()
++    load = load_definition(
++        "toddlerbot/policies/mjx_policy.py",
++        "load_wandb_policy",
++        {"os": os, "wandb": SimpleNamespace(run=run)},
++    )
++    with pytest.raises(FileNotFoundError, match="missing required file"):
++        load("walk")
++
++
++def test_floating_torso_quaternion_uses_mujoco_wxyz_order() -> None:
++    model = make_model(free=True)
++    robot = SimpleNamespace(
++        name="test", motor_ordering=["motor"], joint_ordering=["motor"]
++    )
++    sim = sim_class()(robot, model=model, fixed_base=False)
++    sim.data.qpos[3:7] = [np.sqrt(0.5), 0, 0, np.sqrt(0.5)]
++    mujoco.mj_forward(model, sim.data)
++    np.testing.assert_allclose(
++        sim.get_observation().rot.apply([1, 0, 0]), [0, 1, 0], atol=1e-7
++    )
+diff --git a/tests/test_alfred_telemetry.py b/tests/test_alfred_telemetry.py
+new file mode 100644
+index 0000000..f259028
+--- /dev/null
++++ b/tests/test_alfred_telemetry.py
+@@ -0,0 +1,198 @@
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++
++def test_integer_register_boundaries_under_ubsan(tmp_path):
++    compiler = shutil.which("clang++") or shutil.which("g++")
++    if compiler is None:
++        pytest.skip("C++ compiler unavailable")
++    root = Path(__file__).resolve().parents[1]
++    executable = tmp_path / "dynamixel-integers"
++    include = root / "toddlerbot/actuation/include"
++    subprocess.run(
++        [
++            compiler,
++            "-std=c++17",
++            "-fsanitize=undefined",
++            "-fno-sanitize-recover=all",
++            "-ffunction-sections",
++            "-fdata-sections",
++            "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
++            "-I",
++            str(include),
++            "-I",
++            str(include / "dynamixel_control"),
++            "-I",
++            str(include / "dynamixel_sdk"),
++            str(root / "tests/dynamixel_integer_test.cpp"),
++            str(
++                root / "toddlerbot/actuation/src/dynamixel_control/dynamixel_client.cpp"
++            ),
++            "-o",
++            str(executable),
++        ],
++        check=True,
++        capture_output=True,
++        timeout=60,
++    )
++    subprocess.run([str(executable)], check=True, capture_output=True, timeout=10)
++
++
++def test_disconnected_clients_leave_cleanup_registry(tmp_path):
++    compiler = shutil.which("clang++") or shutil.which("g++")
++    if compiler is None:
++        pytest.skip("C++ compiler unavailable")
++    root = Path(__file__).resolve().parents[1]
++    include = root / "toddlerbot/actuation/include"
++    executable = tmp_path / "dynamixel-cleanup"
++    sources = sorted((root / "toddlerbot/actuation/src/dynamixel_sdk").glob("*.cpp"))
++    subprocess.run(
++        [
++            compiler,
++            "-std=c++17",
++            "-fsanitize=undefined,address",
++            "-fno-sanitize-recover=all",
++            "-I",
++            str(include),
++            "-I",
++            str(include / "dynamixel_control"),
++            "-I",
++            str(include / "dynamixel_sdk"),
++            str(root / "tests/dynamixel_cleanup_test.cpp"),
++            str(
++                root / "toddlerbot/actuation/src/dynamixel_control/dynamixel_client.cpp"
++            ),
++            *map(str, sources),
++            "-o",
++            str(executable),
++        ],
++        check=True,
++        capture_output=True,
++        timeout=60,
++    )
++    subprocess.run([str(executable)], check=True, capture_output=True, timeout=10)
++
++
++def test_current_sensor_mask_selects_each_motor_model():
++    import ast
++    from types import SimpleNamespace
++
++    import numpy as np
++    import numpy.typing as npt
++
++    source = Path(__file__).resolve().parents[1] / "toddlerbot/sim/real_world.py"
++    tree = ast.parse(source.read_text())
++    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef))
++    method = next(
++        node
++        for node in cls.body
++        if isinstance(node, ast.FunctionDef) and node.name == "motor_cur_to_tor"
++    )
++    namespace = {"np": np, "npt": npt}
++    exec(  # noqa: S102 - Load the local numerical method without hardware imports.
++        compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
++        namespace,
++    )
++    robot = SimpleNamespace(
++        cur_sensor_mask=[1, 0, 1],
++        motor_bi=np.array([0.1, 0.1, 0.1]),
++        motor_ki=np.array([0.5, 0.5, 0.5]),
++        motor_tau_max=np.array([10, 10, 10]),
++    )
++    result = namespace["motor_cur_to_tor"](
++        SimpleNamespace(robot=robot),
++        np.array([500, 500, -500], dtype=np.float32),
++        np.array([1, 1, 1], dtype=np.float32),
++    )
++    np.testing.assert_allclose(result, [0.8, 5.0, -2.4])
++
++
++@pytest.fixture
++def motor_writer():
++    import ast
++    from types import SimpleNamespace
++
++    import numpy as np
++    import numpy.typing as npt
++
++    source = Path(__file__).resolve().parents[1] / "toddlerbot/sim/real_world.py"
++    tree = ast.parse(source.read_text())
++    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef))
++    method = next(
++        node
++        for node in cls.body
++        if isinstance(node, ast.FunctionDef) and node.name == "set_motor_target"
++    )
++    calls = []
++    controller = SimpleNamespace(set_motor_pos=lambda *args: calls.append(args))
++    namespace = {"np": np, "npt": npt, "Dict": dict, "dynamixel_cpp": controller}
++    exec(  # noqa: S102 - Exercise the local write method with a fake controller.
++        compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
++        namespace,
++    )
++    robot = SimpleNamespace(
++        nu=3,
++        motor_ordering=["shoulder", "elbow", "wrist"],
++        motor_limits={"shoulder": [-1, 1], "elbow": [0, 2], "wrist": [-2, 0]},
++    )
++    device = SimpleNamespace(
++        robot=robot,
++        motor_unsort_idx=np.array([2, 0, 1]),
++        motor_lens=[1, 2],
++        controllers=["port_a", "port_b"],
++    )
++    return lambda target: namespace["set_motor_target"](device, target), calls, device
++
++
++def test_named_targets_follow_robot_and_controller_order(motor_writer):
++    write, calls, _ = motor_writer
++    write({"wrist": -1.5, "shoulder": 0.5, "elbow": 1.5})
++    assert calls == [(["port_a", "port_b"], [[-1.5], [0.5, 1.5]])]
++
++
++def test_array_targets_accept_configured_limit_boundaries(motor_writer):
++    write, calls, _ = motor_writer
++    write([-1, 2, -2])
++    assert calls == [(["port_a", "port_b"], [[-2], [-1, 2]])]
++
++
++@pytest.mark.parametrize(
++    "target",
++    [
++        {"shoulder": 0, "elbow": 1},
++        {"shoulder": 0, "elbow": 1, "other": 0},
++        {"shoulder": 0, "elbow": 1, "wrist": -1, "other": 0},
++        [0, 1],
++        [0, 1, -1, 0],
++        [[0, 1, -1]],
++        1,
++        [float("nan"), 1, -1],
++        [0, float("inf"), -1],
++        [0, 1, float("-inf")],
++        [1.01, 1, -1],
++        [-1.01, 1, -1],
++        [0, -0.01, -1],
++        [0, 1, 0.01],
++        ["0", "1", "-1"],
++        [True, True, False],
++        [0j, 1j, -1j],
++    ],
++)
++def test_invalid_motor_target_never_reaches_controller(motor_writer, target):
++    write, calls, _ = motor_writer
++    with pytest.raises(ValueError):
++        write(target)
++    assert calls == []
++
++
++@pytest.mark.parametrize("limits", [[1, -1], [float("nan"), 1], [0], [0, 1, 2]])
++def test_invalid_motor_limits_prevent_controller_write(motor_writer, limits):
++    write, calls, device = motor_writer
++    device.robot.motor_limits["shoulder"] = limits
++    with pytest.raises(ValueError):
++        write([0, 1, -1])
++    assert calls == []

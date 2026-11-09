@@ -1,0 +1,12 @@
+pytest
+numpy==1.26.4
+scipy==1.13.1
+mujoco==3.3.4
+jax==0.4.28
+jaxlib==0.4.28
+pyyaml
+joblib
+lz4
+colorama
+line-profiler
+pyzmq

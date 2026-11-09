@@ -1,0 +1,32 @@
+{
+  "project": "Alfred",
+  "upstream_repository": "https://github.com/hshi74/toddlerbot.git",
+  "upstream_commit": "e337f3b177b4b53abff70b31d1695a7b66cc6d2e",
+  "upstream_license": "MIT",
+  "upstream_copyright": "Copyright (c) 2023 Haochen Shi",
+  "patch": "patches/0001-runtime-validation.patch",
+  "patch_sha256": "f33afa9bda0bcf7ee7d63e78935c67fa1b73f35c5ca55e7770e6fee04bfd90ea",
+  "modified_paths": [
+    ".github/workflows/pytest_ci.yml",
+    "tests/test_run_policy.py",
+    "toddlerbot/actuation/include/dynamixel_control/dynamixel_client.h",
+    "toddlerbot/actuation/src/dynamixel_control/dynamixel_client.cpp",
+    "toddlerbot/locomotion/ppo_config.py",
+    "toddlerbot/policies/dp_policy.py",
+    "toddlerbot/policies/mjx_policy.py",
+    "toddlerbot/policies/run_policy.py",
+    "toddlerbot/sim/mujoco_sim.py",
+    "toddlerbot/sim/real_world.py",
+    "toddlerbot/utils/comm_utils.py",
+    "toddlerbot/utils/dataset_utils.py"
+  ],
+  "added_paths": [
+    "tests/dynamixel_cleanup_test.cpp",
+    "tests/dynamixel_integer_test.cpp",
+    "tests/test_alfred_comms.py",
+    "tests/test_alfred_dataset_logger.py",
+    "tests/test_alfred_policy_regressions.py",
+    "tests/test_alfred_telemetry.py"
+  ],
+  "scope": "Local runtime validation, telemetry, policy launch, recording, and regression-test changes. No learned weights or hardware validation."
+}

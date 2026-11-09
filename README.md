@@ -9,7 +9,7 @@ I want to build and launch products across robotics, electronics, embedded syste
 - **[Shaggy](https://github.com/hxssank/shaggy)** connects physical controls to an embedded audio system. Review bank validation, SD-to-flash caching, playback state, and installation recovery.
 - **[Spark](https://github.com/hxssank/spark)** connects enclosure dimensions to PCB and component placement. Review the difference between a routed bench converter and a complete battery product.
 - **[Mazal](https://github.com/hxssank/mazal)** connects a desktop interface to financial records, document provenance, and calculation services. Review the import and persistence rules before the interface code.
-- **[Alfred](https://github.com/hxssank/alfred)** makes the contribution to an existing robotics platform explicit. Review the patch against its pinned ToddlerBot base and the regression tests alongside it.
+- **[Alfred](https://github.com/hxssank/recruiter-portfolio/tree/main/projects/alfred)** makes the contribution to an existing robotics platform explicit. Review the patch against its pinned ToddlerBot base and the regression tests alongside it.
 
 ## Hardware and robotics
 
@@ -17,7 +17,7 @@ I want to build and launch products across robotics, electronics, embedded syste
 | --- | --- | --- | --- |
 | [Shaggy](https://github.com/hxssank/shaggy) | Make an audio-stem player respond to physical controls and recover from media failures | [Firmware](https://github.com/hxssank/shaggy/tree/main/firmware), [host tools](https://github.com/hxssank/shaggy/tree/main/tools), [carrier board](https://github.com/hxssank/shaggy/tree/main/hardware) | Host tests use fake hardware; they do not measure playback timing or audio quality |
 | [Spark](https://github.com/hxssank/spark) | Fit power electronics, a battery reservation, and an enclosure into a compact package | [Bench PCB](https://github.com/hxssank/spark/tree/main/electronics/boost-prototype), [CAD generators](https://github.com/hxssank/spark/tree/main/mechanical), [review UI](https://github.com/hxssank/spark/tree/main/review) | A 25 W design target; charging, USB-PD, protection, temperature, and physical fit are unfinished |
-| [Alfred](https://github.com/hxssank/alfred) | Validate commands, communication, and recordings in a humanoid research stack | [Runtime patch](https://github.com/hxssank/alfred/tree/main/patches), [model exporter](https://github.com/hxssank/alfred/tree/main/scripts) | ToddlerBot provides the upstream platform; no trained Alfred policy or hardware qualification |
+| [Alfred](https://github.com/hxssank/recruiter-portfolio/tree/main/projects/alfred) | Validate commands, communication, and recordings in a humanoid research stack | [Runtime patch](https://github.com/hxssank/recruiter-portfolio/tree/main/projects/alfred/patches), [model exporter](https://github.com/hxssank/recruiter-portfolio/tree/main/projects/alfred/scripts) | ToddlerBot provides the upstream platform; no trained Alfred policy or hardware qualification |
 | [Pager](https://github.com/hxssank/pager) | Package a pocket Linux computer with a thumb keyboard and trackball | [Layout constraints](https://github.com/hxssank/pager/blob/main/mechanical/slim-layout.json), [CAD generator](https://github.com/hxssank/pager/blob/main/mechanical/build_slim.py) | The 96 x 166 x 17.4 mm envelope is a packaging target, not a completed device |
 
 ## Software and interfaces
