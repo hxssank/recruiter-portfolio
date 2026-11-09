@@ -2,6 +2,8 @@
 
 Runtime validation and simulation experiments for a small humanoid robot, built on [ToddlerBot](https://github.com/hshi74/toddlerbot). Alfred's contribution here is a reviewable patch set, regression tests, and a URDF-to-browser geometry exporter. The upstream robot platform, mechanical models, and original software belong to the ToddlerBot contributors.
 
+The key engineering question is which checks belong before a message becomes usable, a target reaches a motor controller, or an episode becomes a saved file. The patch treats those as separate contracts. [The engineering walkthrough](ENGINEERING.md) traces their ordering, works through a joint-mapping example, and identifies the command-deadline and arming work still missing.
+
 This repository is a robotics development project. It does not contain a demonstrated household robot, trained Alfred policy, or validated hardware build.
 
 ## What changed

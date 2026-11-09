@@ -4,6 +4,30 @@ Hassan Kazmi · Electrical engineering at Toronto Metropolitan University
 
 I want to build and launch products across robotics, electronics, embedded systems, CAD, and software. This portfolio connects each project to source code, design decisions, and the evidence available today.
 
+## Read the engineering
+
+The project notes follow a mechanism through its source, work through an example, and identify what would change the design. Start with the question closest to your work:
+
+| Area | Design question | Detailed walkthrough |
+| --- | --- | --- |
+| Embedded audio | How do elapsed-time fades preserve loop playback, and what survives a failed cache replacement? | [Shaggy timing, media, and recovery](https://github.com/hxssank/shaggy/blob/main/ENGINEERING.md) |
+| Power electronics | How do voltage sag and resistance turn an output-power target into current, heat, and usable energy? | [Spark's operating-point calculation](https://github.com/hxssank/spark/blob/main/ENGINEERING.md) |
+| Mechanical design | What must fit inside a 17.4 mm stack, and which part substitution breaks it? | [Pager's thickness and containment checks](https://github.com/hxssank/pager/blob/main/ENGINEERING.md) |
+| Robotics | What can command validation and packet authentication establish before a motor moves? | [Alfred's runtime contracts](projects/alfred/ENGINEERING.md) |
+| Desktop software | How do imported documents become reviewable records without silently changing existing data? | [Mazal's import and persistence flow](https://github.com/hxssank/mazal/blob/main/ENGINEERING.md) |
+| Interaction and state | Which completed actions belong in history, and how can a stale browser tab overwrite them? | [Cant Pin Me's workout and storage model](https://github.com/hxssank/cant-pin-me/blob/main/ENGINEERING.md) |
+| Browser data | How do photos and garment metadata stay consistent when they use different stores? | [Drip's state transitions and recovery](https://github.com/hxssank/drip/blob/main/ENGINEERING.md) |
+| Learning software | How can separate tabs save progress without undoing a reset or an unrelated edit? | [Mazal Academy's progress transactions](https://github.com/hxssank/mazal-academy/blob/main/ENGINEERING.md) |
+| Circuit foundations | When does a load change a divider's output, and how can an RC model check its own limits? | [Worked circuit derivations](https://github.com/hxssank/electrical-engineering-coursework/blob/main/ENGINEERING.md) |
+
+## Connecting the disciplines
+
+**Power changes packaging.** Spark's model derives input current from output power, converter efficiency, cell voltage, and resistance. That current creates resistive loss. Pager's stack reserves every millimetre between the display and rear panel, including battery expansion space. Together, these projects make a product-design dependency concrete: an electrical target can require thermal or battery space that the enclosure has not reserved. A CAD fit and an energy calculation need to agree before either supports a hardware claim.
+
+**Recovery belongs in the design.** Shaggy distinguishes cached audio from its separate fallback bank. Mazal separates document review from committing financial records. Drip stores image blobs separately from wardrobe metadata. In each case, the engineering question is what remains valid when only part of an operation succeeds. The walkthroughs identify the write boundary and the recovery path instead of treating a successful normal run as sufficient evidence.
+
+**Validation has a defined reach.** Alfred validates message structure and, when a shared key is configured, authentication. Motor deadlines and physical stopping behavior remain separate requirements. Pager's geometry tests can reject overlapping reservations, while a hypothetical display thickness still needs a real component drawing. The next step for each project is a specific measurement or failure-injection test, not a broader claim based on the same existing test.
+
 ## Start with these projects
 
 - **[Shaggy](https://github.com/hxssank/shaggy)** connects physical controls to an embedded audio system. Review bank validation, SD-to-flash caching, playback state, and installation recovery.
